@@ -1,5 +1,5 @@
 {
   "name": "Stack-Counter",
-  "description": "A visual counter that builds a stack of blocks as you count up, now with AI-powered layer detection from photos.",
+  "description": "AI-powered layer detection and visual counter with advanced model settings (v1.0.2).",
   "requestFramePermissions": ["camera"]
 }

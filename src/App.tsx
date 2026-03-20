@@ -40,11 +40,25 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [lastManualCount, setLastManualCount] = useState<number | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    type: 'gemini',
-    modelName: 'gemini-3.1-pro-preview',
-    temperature: 1
+  const [modelConfig, setModelConfig] = useState<ModelConfig>(() => {
+    const saved = localStorage.getItem('stack_counter_config');
+    if (saved) {
+      try {
+        return JSON.parse(saved);
+      } catch (e) {
+        console.error("Failed to parse saved config", e);
+      }
+    }
+    return {
+      type: 'gemini',
+      modelName: 'gemini-3.1-pro-preview',
+      temperature: 1
+    };
   });
+
+  useEffect(() => {
+    localStorage.setItem('stack_counter_config', JSON.stringify(modelConfig));
+  }, [modelConfig]);
   
   const scrollRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -125,6 +139,7 @@ export default function App() {
           ],
           config: {
             systemInstruction,
+            temperature: modelConfig.temperature ?? 1,
             thinkingConfig: {
               includeThoughts: true
             }
@@ -463,7 +478,7 @@ export default function App() {
         {/* Footer */}
         <footer className="mt-8 text-center">
           <p className="text-xs text-zinc-400 font-medium uppercase tracking-tighter">
-            AI-Powered Layer Detection
+            AI-Powered Layer Detection • v1.0.3
           </p>
         </footer>
       </div>
@@ -555,100 +570,104 @@ export default function App() {
               exit={{ scale: 0.9, y: 20 }}
               className="bg-white w-full max-w-sm rounded-3xl shadow-2xl overflow-hidden"
             >
-              <div className="p-6 border-b border-zinc-100 flex justify-between items-center">
-                <div className="flex items-center gap-2">
-                  <Settings className="text-zinc-400" size={20} />
-                  <h2 className="font-bold text-lg">Model Settings</h2>
-                </div>
-                <button onClick={() => setIsSettingsOpen(false)} className="p-2 hover:bg-zinc-100 rounded-full transition-colors">
-                  <X size={20} />
-                </button>
-              </div>
-
-              <div className="p-6 space-y-6">
-                {/* Type Selector */}
-                <div className="flex p-1 bg-zinc-100 rounded-xl">
-                  <button 
-                    onClick={() => setModelConfig(prev => ({ ...prev, type: 'gemini' }))}
-                    className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-sm font-bold transition-all ${modelConfig.type === 'gemini' ? 'bg-white shadow-sm text-emerald-600' : 'text-zinc-500 hover:text-zinc-700'}`}
-                  >
-                    <Cpu size={16} />
-                    Gemini
-                  </button>
-                  <button 
-                    onClick={() => setModelConfig(prev => ({ ...prev, type: 'custom' }))}
-                    className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-sm font-bold transition-all ${modelConfig.type === 'custom' ? 'bg-white shadow-sm text-emerald-600' : 'text-zinc-500 hover:text-zinc-700'}`}
-                  >
-                    <Globe size={16} />
-                    Custom API
+              <div className="flex flex-col max-h-[85vh]">
+                <div className="p-6 border-b border-zinc-100 flex justify-between items-center shrink-0">
+                  <div className="flex items-center gap-2">
+                    <Settings className="text-zinc-400" size={20} />
+                    <h2 className="font-bold text-lg">Model Settings</h2>
+                  </div>
+                  <button onClick={() => setIsSettingsOpen(false)} className="p-2 hover:bg-zinc-100 rounded-full transition-colors">
+                    <X size={20} />
                   </button>
                 </div>
-
-                <div className="space-y-4">
-                  {modelConfig.type === 'custom' && (
+  
+                <div className="p-6 space-y-6 overflow-y-auto custom-scrollbar">
+                  {/* Type Selector */}
+                  <div className="flex p-1 bg-zinc-100 rounded-xl">
+                    <button 
+                      onClick={() => setModelConfig(prev => ({ ...prev, type: 'gemini' }))}
+                      className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-sm font-bold transition-all ${modelConfig.type === 'gemini' ? 'bg-white shadow-sm text-emerald-600' : 'text-zinc-500 hover:text-zinc-700'}`}
+                    >
+                      <Cpu size={16} />
+                      Gemini
+                    </button>
+                    <button 
+                      onClick={() => setModelConfig(prev => ({ ...prev, type: 'custom' }))}
+                      className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-sm font-bold transition-all ${modelConfig.type === 'custom' ? 'bg-white shadow-sm text-emerald-600' : 'text-zinc-500 hover:text-zinc-700'}`}
+                    >
+                      <Globe size={16} />
+                      Custom API
+                    </button>
+                  </div>
+  
+                  <div className="space-y-4">
+                    {modelConfig.type === 'custom' && (
+                      <div>
+                        <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">Endpoint URL</label>
+                        <input 
+                          type="text"
+                          placeholder="https://api.openai.com/v1"
+                          value={modelConfig.endpoint || ''}
+                          onChange={(e) => setModelConfig(prev => ({ ...prev, endpoint: e.target.value }))}
+                          className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                        />
+                      </div>
+                    )}
+                    
                     <div>
-                      <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">Endpoint URL</label>
+                      <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">
+                        {modelConfig.type === 'gemini' ? 'Gemini API Key (Optional)' : 'API Key'}
+                      </label>
                       <input 
-                        type="text"
-                        placeholder="https://api.openai.com/v1"
-                        value={modelConfig.endpoint || ''}
-                        onChange={(e) => setModelConfig(prev => ({ ...prev, endpoint: e.target.value }))}
+                        type="password"
+                        placeholder={modelConfig.type === 'gemini' ? 'Leave empty to use system key' : 'sk-...'}
+                        value={modelConfig.apiKey || ''}
+                        onChange={(e) => setModelConfig(prev => ({ ...prev, apiKey: e.target.value }))}
                         className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
                       />
                     </div>
-                  )}
-                  
-                  <div>
-                    <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">
-                      {modelConfig.type === 'gemini' ? 'Gemini API Key (Optional)' : 'API Key'}
-                    </label>
-                    <input 
-                      type="password"
-                      placeholder={modelConfig.type === 'gemini' ? 'Leave empty to use system key' : 'sk-...'}
-                      value={modelConfig.apiKey || ''}
-                      onChange={(e) => setModelConfig(prev => ({ ...prev, apiKey: e.target.value }))}
-                      className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">Model Name</label>
-                    <input 
-                      type="text"
-                      placeholder={modelConfig.type === 'gemini' ? 'gemini-3.1-pro-preview' : 'gpt-4o'}
-                      value={modelConfig.modelName || ''}
-                      onChange={(e) => setModelConfig(prev => ({ ...prev, modelName: e.target.value }))}
-                      className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1 flex justify-between">
-                      <span>Temperature</span>
-                      <span className="text-emerald-600">{modelConfig.temperature ?? 1}</span>
-                    </label>
-                    <input 
-                      type="range" 
-                      min="0" 
-                      max="2" 
-                      step="0.1" 
-                      value={modelConfig.temperature ?? 1}
-                      onChange={(e) => setModelConfig(prev => ({ ...prev, temperature: parseFloat(e.target.value) }))}
-                      className="w-full accent-emerald-500"
-                    />
-                    <p className="text-[10px] text-zinc-400 mt-1">
-                      Lower values are more deterministic, higher values more creative.
-                    </p>
+  
+                    <div>
+                      <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">Model Name</label>
+                      <input 
+                        type="text"
+                        placeholder={modelConfig.type === 'gemini' ? 'gemini-3.1-pro-preview' : 'gpt-4o'}
+                        value={modelConfig.modelName || ''}
+                        onChange={(e) => setModelConfig(prev => ({ ...prev, modelName: e.target.value }))}
+                        className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                      />
+                    </div>
+  
+                    <div>
+                      <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1 flex justify-between">
+                        <span>Temperature</span>
+                        <span className="text-emerald-600">{modelConfig.temperature ?? 1}</span>
+                      </label>
+                      <input 
+                        type="range" 
+                        min="0" 
+                        max="2" 
+                        step="0.1" 
+                        value={modelConfig.temperature ?? 1}
+                        onChange={(e) => setModelConfig(prev => ({ ...prev, temperature: parseFloat(e.target.value) }))}
+                        className="w-full accent-emerald-500"
+                      />
+                      <p className="text-[10px] text-zinc-400 mt-1">
+                        Lower values are more deterministic, higher values more creative.
+                      </p>
+                    </div>
                   </div>
                 </div>
-
-                <button 
-                  onClick={() => setIsSettingsOpen(false)}
-                  className="w-full py-4 bg-zinc-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-zinc-800 transition-colors shadow-lg shadow-zinc-200"
-                >
-                  <Save size={20} />
-                  SAVE CONFIGURATION
-                </button>
+  
+                <div className="p-6 border-t border-zinc-100 shrink-0">
+                  <button 
+                    onClick={() => setIsSettingsOpen(false)}
+                    className="w-full py-4 bg-zinc-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-zinc-800 transition-colors shadow-lg shadow-zinc-200"
+                  >
+                    <Save size={20} />
+                    SAVE CONFIGURATION
+                  </button>
+                </div>
               </div>
             </motion.div>
           </motion.div>
@@ -658,6 +677,16 @@ export default function App() {
       <style dangerouslySetInnerHTML={{ __html: `
         .no-scrollbar::-webkit-scrollbar {
           display: none;
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: transparent;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background: #e4e4e7;
+          border-radius: 10px;
         }
       `}} />
     </div>
