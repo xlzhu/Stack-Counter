@@ -5,12 +5,20 @@
 
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Plus, Minus, RotateCcw, Layers, Camera, Upload, Loader2, X, Check } from 'lucide-react';
+import { Plus, Minus, RotateCcw, Layers, Camera, Upload, Loader2, X, Check, Settings, Globe, Cpu, Save } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 
 interface StackItem {
   id: string;
   color: string;
+}
+
+interface ModelConfig {
+  type: 'gemini' | 'custom';
+  endpoint?: string;
+  apiKey?: string;
+  modelName?: string;
+  temperature?: number;
 }
 
 const COLORS = [
@@ -27,9 +35,16 @@ const COLORS = [
 export default function App() {
   const [stack, setStack] = useState<StackItem[]>([]);
   const [isCameraActive, setIsCameraActive] = useState(false);
+  const [zoom, setZoom] = useState(1);
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastManualCount, setLastManualCount] = useState<number | null>(null);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [modelConfig, setModelConfig] = useState<ModelConfig>({
+    type: 'gemini',
+    modelName: 'gemini-3.1-pro-preview',
+    temperature: 1
+  });
   
   const scrollRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -81,71 +96,160 @@ export default function App() {
     setIsProcessing(true);
     setError(null);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      
+      const promptText = "Methodically count the number of thin stacked layers in this image (e.g., stacked trays). These layers are very dense. First, identify the boundaries of the stack. Then, count each individual layer by looking at the distinct horizontal lines on the vertical edges. Be extremely precise and do not skip any layers. Return ONLY the final integer count.";
       const systemInstruction = "You are a precision counting expert. " + 
         (lastManualCount ? `Note: For a similar stack, a manual count of ${lastManualCount} was previously recorded. Use this as a reference but verify the current image exactly. ` : "") +
         "Count each individual layer by looking at the distinct horizontal lines on the vertical edges. Be extremely precise and do not skip any layers. Return ONLY the final integer count.";
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-pro-preview",
-        contents: [
-          {
-            parts: [
-              { text: "Methodically count the number of thin stacked layers in this image (e.g., stacked trays). These layers are very dense. First, identify the boundaries of the stack. Then, count each individual layer by looking at the distinct horizontal lines on the vertical edges. Be extremely precise and do not skip any layers. Return ONLY the final integer count." },
-              {
-                inlineData: {
-                  mimeType: "image/jpeg",
-                  data: base64Data.split(',')[1]
-                }
-              }
-            ]
-          }
-        ],
-        config: {
-          systemInstruction,
-          thinkingConfig: {
-            includeThoughts: true
-          }
-        }
-      });
+      let count = 0;
 
-      const resultText = response.text?.trim() || "0";
-      const count = parseInt(resultText.replace(/[^0-9]/g, ''), 10);
+      if (modelConfig.type === 'gemini') {
+        const apiKey = modelConfig.apiKey?.trim() || process.env.GEMINI_API_KEY;
+        if (!apiKey) throw new Error("Gemini API Key is missing. Please configure it in Settings.");
+        
+        const ai = new GoogleGenAI({ apiKey });
+        const response = await ai.models.generateContent({
+          model: modelConfig.modelName || "gemini-3.1-pro-preview",
+          contents: [
+            {
+              parts: [
+                { text: promptText },
+                {
+                  inlineData: {
+                    mimeType: "image/jpeg",
+                    data: base64Data.split(',')[1]
+                  }
+                }
+              ]
+            }
+          ],
+          config: {
+            systemInstruction,
+            thinkingConfig: {
+              includeThoughts: true
+            }
+          }
+        });
+
+        const resultText = response.text?.trim() || "0";
+        count = parseInt(resultText.replace(/[^0-9]/g, ''), 10);
+      } else {
+        // Custom API (OpenAI-compatible format)
+        if (!modelConfig.endpoint) throw new Error("Custom endpoint URL is required");
+        
+        let finalEndpoint = modelConfig.endpoint.trim();
+        // Automatically append /chat/completions if only base URL is provided
+        if (!finalEndpoint.endsWith('/chat/completions')) {
+          finalEndpoint = finalEndpoint.replace(/\/$/, '') + '/chat/completions';
+        }
+        
+        const apiKey = modelConfig.apiKey?.trim() || '';
+        if (!apiKey) throw new Error("API Key is required for Custom API mode.");
+
+        const response = await fetch('/api/proxy/llm', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            endpoint: finalEndpoint,
+            apiKey: apiKey,
+            body: {
+              model: modelConfig.modelName || 'gpt-4o',
+              messages: [
+                { role: 'system', content: systemInstruction },
+                {
+                  role: 'user',
+                  content: [
+                    { type: 'text', text: promptText },
+                    {
+                      type: 'image_url',
+                      image_url: { url: base64Data }
+                    }
+                  ]
+                }
+              ],
+              temperature: modelConfig.temperature ?? 1
+            }
+          })
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          const errorObj = errorData.error || errorData;
+          let errorMessage = errorObj.message || errorObj.type || (typeof errorData === 'string' ? errorData : null);
+          
+          if (errorObj.type === 'access_terminated_error') {
+            errorMessage = "API Access Terminated: Your API key or account has been disabled by the provider. Please check your account status.";
+          } else if (errorObj.type === 'insufficient_quota' || errorObj.code === 'insufficient_quota') {
+            errorMessage = "Insufficient Quota: Your API account has run out of credits or reached its limit.";
+          }
+          
+          throw new Error(errorMessage || `API Error: ${response.status}`);
+        }
+
+        const data = await response.json();
+        const resultText = data.choices?.[0]?.message?.content?.trim() || "0";
+        count = parseInt(resultText.replace(/[^0-9]/g, ''), 10);
+      }
       
       if (!isNaN(count)) {
         updateStackCount(count);
       } else {
         setError("Could not determine count. Please try again.");
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("AI Analysis Error:", err);
-      setError("Analysis failed. Please check your connection or image quality.");
+      setError(err.message || "Analysis failed. Please check your connection or image quality.");
     } finally {
       setIsProcessing(false);
       setIsCameraActive(false);
     }
   };
 
-  const startCamera = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        setIsCameraActive(true);
-      }
-    } catch (err) {
-      console.error("Camera Error:", err);
-      setError("Could not access camera. Please check permissions.");
-    }
+  const startCamera = () => {
+    setIsCameraActive(true);
   };
 
+  useEffect(() => {
+    let stream: MediaStream | null = null;
+
+    const initCamera = async () => {
+      if (isCameraActive) {
+        // Wait a tiny bit for the modal to mount and videoRef to be available
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+        if (!videoRef.current) return;
+
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ 
+            video: { 
+              facingMode: 'environment', 
+              width: { ideal: 1920 }, 
+              height: { ideal: 1080 } 
+            } 
+          });
+          if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+          }
+        } catch (err) {
+          console.error("Camera Error:", err);
+          setError("Could not access camera. Please check permissions.");
+          setIsCameraActive(false);
+        }
+      }
+    };
+
+    initCamera();
+
+    return () => {
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, [isCameraActive]);
+
   const stopCamera = () => {
-    if (videoRef.current && videoRef.current.srcObject) {
-      const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
-      tracks.forEach(track => track.stop());
-      videoRef.current.srcObject = null;
-    }
     setIsCameraActive(false);
   };
 
@@ -198,6 +302,13 @@ export default function App() {
             <h1 className="text-xl font-bold tracking-tight">Stack-Counter</h1>
           </div>
           <div className="flex gap-2">
+            <button 
+              onClick={() => setIsSettingsOpen(true)}
+              className="p-2 bg-zinc-100 rounded-lg text-zinc-600 hover:bg-zinc-200 transition-colors"
+              title="Model Settings"
+            >
+              <Settings size={20} />
+            </button>
             <button 
               onClick={() => fileInputRef.current?.click()}
               className="p-2 bg-zinc-100 rounded-lg text-zinc-600 hover:bg-zinc-200 transition-colors"
@@ -373,12 +484,14 @@ export default function App() {
               </button>
             </div>
             
-            <div className="flex-1 relative overflow-hidden flex items-center justify-center">
+            <div className="flex-1 relative overflow-hidden flex items-center justify-center bg-black">
               <video 
                 ref={videoRef} 
                 autoPlay 
                 playsInline 
-                className="w-full h-full object-cover"
+                muted
+                className="w-full h-full object-cover transition-transform duration-200"
+                style={{ transform: `scale(${zoom})` }}
               />
               {/* Scan Overlay */}
               <div className="absolute inset-0 border-[40px] border-black/40 pointer-events-none flex items-center justify-center">
@@ -396,6 +509,21 @@ export default function App() {
                   />
                 </div>
               </div>
+
+              {/* Zoom Control */}
+              <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-black/40 backdrop-blur-md px-6 py-3 rounded-full border border-white/10">
+                <Minus size={16} className="text-white/60" />
+                <input 
+                  type="range" 
+                  min="1" 
+                  max="3" 
+                  step="0.1" 
+                  value={zoom}
+                  onChange={(e) => setZoom(parseFloat(e.target.value))}
+                  className="w-32 accent-emerald-400"
+                />
+                <Plus size={16} className="text-white/60" />
+              </div>
             </div>
 
             <div className="p-12 flex justify-center items-center bg-black/80">
@@ -411,6 +539,121 @@ export default function App() {
       </AnimatePresence>
 
       <canvas ref={canvasRef} className="hidden" />
+
+      {/* Settings Modal */}
+      <AnimatePresence>
+        {isSettingsOpen && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] bg-black/60 backdrop-blur-sm flex items-center justify-center p-6"
+          >
+            <motion.div 
+              initial={{ scale: 0.9, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.9, y: 20 }}
+              className="bg-white w-full max-w-sm rounded-3xl shadow-2xl overflow-hidden"
+            >
+              <div className="p-6 border-b border-zinc-100 flex justify-between items-center">
+                <div className="flex items-center gap-2">
+                  <Settings className="text-zinc-400" size={20} />
+                  <h2 className="font-bold text-lg">Model Settings</h2>
+                </div>
+                <button onClick={() => setIsSettingsOpen(false)} className="p-2 hover:bg-zinc-100 rounded-full transition-colors">
+                  <X size={20} />
+                </button>
+              </div>
+
+              <div className="p-6 space-y-6">
+                {/* Type Selector */}
+                <div className="flex p-1 bg-zinc-100 rounded-xl">
+                  <button 
+                    onClick={() => setModelConfig(prev => ({ ...prev, type: 'gemini' }))}
+                    className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-sm font-bold transition-all ${modelConfig.type === 'gemini' ? 'bg-white shadow-sm text-emerald-600' : 'text-zinc-500 hover:text-zinc-700'}`}
+                  >
+                    <Cpu size={16} />
+                    Gemini
+                  </button>
+                  <button 
+                    onClick={() => setModelConfig(prev => ({ ...prev, type: 'custom' }))}
+                    className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-sm font-bold transition-all ${modelConfig.type === 'custom' ? 'bg-white shadow-sm text-emerald-600' : 'text-zinc-500 hover:text-zinc-700'}`}
+                  >
+                    <Globe size={16} />
+                    Custom API
+                  </button>
+                </div>
+
+                <div className="space-y-4">
+                  {modelConfig.type === 'custom' && (
+                    <div>
+                      <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">Endpoint URL</label>
+                      <input 
+                        type="text"
+                        placeholder="https://api.openai.com/v1"
+                        value={modelConfig.endpoint || ''}
+                        onChange={(e) => setModelConfig(prev => ({ ...prev, endpoint: e.target.value }))}
+                        className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                      />
+                    </div>
+                  )}
+                  
+                  <div>
+                    <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">
+                      {modelConfig.type === 'gemini' ? 'Gemini API Key (Optional)' : 'API Key'}
+                    </label>
+                    <input 
+                      type="password"
+                      placeholder={modelConfig.type === 'gemini' ? 'Leave empty to use system key' : 'sk-...'}
+                      value={modelConfig.apiKey || ''}
+                      onChange={(e) => setModelConfig(prev => ({ ...prev, apiKey: e.target.value }))}
+                      className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">Model Name</label>
+                    <input 
+                      type="text"
+                      placeholder={modelConfig.type === 'gemini' ? 'gemini-3.1-pro-preview' : 'gpt-4o'}
+                      value={modelConfig.modelName || ''}
+                      onChange={(e) => setModelConfig(prev => ({ ...prev, modelName: e.target.value }))}
+                      className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1 flex justify-between">
+                      <span>Temperature</span>
+                      <span className="text-emerald-600">{modelConfig.temperature ?? 1}</span>
+                    </label>
+                    <input 
+                      type="range" 
+                      min="0" 
+                      max="2" 
+                      step="0.1" 
+                      value={modelConfig.temperature ?? 1}
+                      onChange={(e) => setModelConfig(prev => ({ ...prev, temperature: parseFloat(e.target.value) }))}
+                      className="w-full accent-emerald-500"
+                    />
+                    <p className="text-[10px] text-zinc-400 mt-1">
+                      Lower values are more deterministic, higher values more creative.
+                    </p>
+                  </div>
+                </div>
+
+                <button 
+                  onClick={() => setIsSettingsOpen(false)}
+                  className="w-full py-4 bg-zinc-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-zinc-800 transition-colors shadow-lg shadow-zinc-200"
+                >
+                  <Save size={20} />
+                  SAVE CONFIGURATION
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <style dangerouslySetInnerHTML={{ __html: `
         .no-scrollbar::-webkit-scrollbar {
