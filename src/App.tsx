@@ -5,8 +5,9 @@
 
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Plus, Minus, RotateCcw, Layers, Camera, Upload, Loader2, X, Check, Settings, Globe, Cpu, Save, Languages } from 'lucide-react';
+import { Plus, Minus, RotateCcw, Layers, Camera, Upload, Loader2, X, Check, Settings, Globe, Cpu, Save, Languages, Zap, Image as ImageIcon } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
+import { analyzeImageLocal } from './utils/cv';
 
 interface StackItem {
   id: string;
@@ -55,7 +56,16 @@ const TRANSLATIONS = {
     footer: 'AI-Powered Layer Detection',
     promptText: "Methodically count the number of thin stacked layers in this image (e.g., stacked trays). These layers are very dense. First, identify the boundaries of the stack. Then, count each individual layer by looking at the distinct horizontal lines on the vertical edges. Be extremely precise and do not skip any layers. Return ONLY the final integer count.",
     systemInstruction: "You are a precision counting expert. ",
-    manualCountNote: "Note: For a similar stack, a manual count of {count} was previously recorded. Use this as a reference but verify the current image exactly. "
+    manualCountNote: "Note: For a similar stack, a manual count of {count} was previously recorded. Use this as a reference but verify the current image exactly. ",
+    fastMode: 'Fast Local Mode',
+    aiMode: 'AI Mode',
+    viewStack: 'Stack View',
+    viewImage: 'Image View',
+    roiStart: 'ROI Start',
+    roiEnd: 'ROI End',
+    peakDistance: 'Peak Distance',
+    peakProminence: 'Peak Prominence',
+    localAnalyzing: 'Analyzing Locally...'
   },
   zh: {
     title: '层级计数器',
@@ -88,7 +98,16 @@ const TRANSLATIONS = {
     footer: 'AI 驱动的层级检测',
     promptText: "有条理地计算这张图片中薄堆叠层的数量（例如，堆叠的托盘）。这些层非常密集。首先，识别堆栈的边界。然后，通过观察垂直边缘上明显的水平线来计算每个单独的层。请务必极其精确，不要跳过任何层。仅返回最终的整数计数。",
     systemInstruction: "你是一个精准计数专家。",
-    manualCountNote: "注意：对于类似的堆栈，之前记录的手动计数为 {count}。请将其作为参考，但要准确核实当前图像。"
+    manualCountNote: "注意：对于类似的堆栈，之前记录的手动计数为 {count}。请将其作为参考，但要准确核实当前图像。",
+    fastMode: '极速本地模式',
+    aiMode: 'AI 模式',
+    viewStack: '堆栈视图',
+    viewImage: '图像视图',
+    roiStart: '检测区域起点',
+    roiEnd: '检测区域终点',
+    peakDistance: '峰值间距',
+    peakProminence: '峰值突起度',
+    localAnalyzing: '本地分析中...'
   }
 };
 
@@ -104,7 +123,7 @@ const COLORS = [
 ];
 
 const compressImage = (dataUrl: string, maxWidth = 1024, maxHeight = 1024, initialQuality = 0.7): Promise<string> => {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
       let width = img.width;
@@ -142,7 +161,7 @@ const compressImage = (dataUrl: string, maxWidth = 1024, maxHeight = 1024, initi
         resolve(dataUrl);
       }
     };
-    img.onerror = () => resolve(dataUrl);
+    img.onerror = () => reject(new Error("Failed to load image. The format might not be supported by your browser."));
     img.src = dataUrl;
   });
 };
@@ -171,6 +190,17 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [lastManualCount, setLastManualCount] = useState<number | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [analysisMode, setAnalysisMode] = useState<'ai' | 'local'>('ai');
+  const [viewMode, setViewMode] = useState<'stack' | 'image'>('stack');
+  const [uploadedImage, setUploadedImage] = useState<string | null>(null);
+  const [localResult, setLocalResult] = useState<{peaks: number[], y1: number, y2: number, height: number} | null>(null);
+  const [localParams, setLocalParams] = useState({
+    roiStart: 0.3,
+    roiEnd: 0.7,
+    distance: 6,
+    prominence: 15
+  });
+  
   const [modelConfig, setModelConfig] = useState<ModelConfig>(() => {
     const saved = localStorage.getItem('stack_counter_config');
     if (saved) {
@@ -209,6 +239,8 @@ export default function App() {
   const reset = useCallback(() => {
     setStack([]);
     setError(null);
+    setUploadedImage(null);
+    setLocalResult(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -240,7 +272,40 @@ export default function App() {
   const analyzeImage = async (base64Data: string) => {
     setIsProcessing(true);
     setError(null);
+    setUploadedImage(base64Data);
+    
     try {
+      if (analysisMode === 'local') {
+        const img = new Image();
+        await new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = reject;
+          img.src = base64Data;
+        });
+        
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error("Could not get canvas context");
+        
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, img.width, img.height);
+        
+        const result = analyzeImageLocal(
+          imageData, 
+          [localParams.roiStart, localParams.roiEnd], 
+          localParams.distance, 
+          localParams.prominence
+        );
+        
+        setLocalResult({ peaks: result.peaks, y1: result.y1, y2: result.y2, height: result.height });
+        updateStackCount(result.count);
+        setViewMode('image');
+        setIsProcessing(false);
+        return;
+      }
+
       const promptText = t.promptText;
       const systemInstruction = t.systemInstruction + 
         (lastManualCount ? t.manualCountNote.replace('{count}', lastManualCount.toString()) : "") +
@@ -517,19 +582,66 @@ export default function App() {
     }
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      const reader = new FileReader();
-      reader.onloadend = async () => {
-        const compressedDataUrl = await compressImage(reader.result as string);
-        analyzeImage(compressedDataUrl);
-        // Clear the input value so the same file can be uploaded again
+      try {
+        setIsProcessing(true);
+        setError(null);
+        let processedFile = file;
+        
+        // Convert HEIC/HEIF to JPEG
+        if (file.name.toLowerCase().endsWith('.heic') || file.name.toLowerCase().endsWith('.heif')) {
+          try {
+            // Dynamically import to avoid Vite build/SSR issues with WASM/Workers
+            const heic2any = (await import('heic2any')).default;
+            const convertedBlob = await heic2any({
+              blob: file,
+              toType: 'image/jpeg',
+              quality: 0.8
+            });
+            
+            // heic2any can return a Blob or Blob[]
+            const blobToUse = Array.isArray(convertedBlob) ? convertedBlob[0] : convertedBlob;
+            processedFile = new File([blobToUse], file.name.replace(/\.heic$|\.heif$/i, '.jpg'), {
+              type: 'image/jpeg'
+            });
+          } catch (heicError: any) {
+            console.warn("HEIC Conversion Error, attempting native fallback:", heicError);
+            // Fallback: The browser might support it natively (e.g., Safari), or it might be a misnamed JPEG.
+            // We will just proceed with the original file and let the Image object try to load it.
+            processedFile = file;
+          }
+        }
+
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+          try {
+            const compressedDataUrl = await compressImage(reader.result as string);
+            await analyzeImage(compressedDataUrl);
+          } catch (err: any) {
+            console.error("Image compression/analysis error:", err);
+            setError(`${t.analysisFailed} (${err?.message || 'Unknown error'})`);
+            setIsProcessing(false);
+          } finally {
+            // Clear the input value so the same file can be uploaded again
+            if (fileInputRef.current) {
+              fileInputRef.current.value = "";
+            }
+          }
+        };
+        reader.onerror = () => {
+          throw new Error("Failed to read file");
+        };
+        reader.readAsDataURL(processedFile);
+      } catch (error: any) {
+        console.error("Error processing file:", error);
+        setError(`${t.analysisFailed} (${error?.message || String(error)})`);
+        setIsProcessing(false);
         if (fileInputRef.current) {
           fileInputRef.current.value = "";
         }
-      };
-      reader.readAsDataURL(file);
+      }
     }
   };
 
@@ -553,6 +665,14 @@ export default function App() {
             <h1 className="text-xl font-bold tracking-tight">{t.title}</h1>
           </div>
           <div className="flex gap-2">
+            <button 
+              onClick={() => setAnalysisMode(prev => prev === 'ai' ? 'local' : 'ai')}
+              className={`p-2 rounded-lg transition-colors flex items-center gap-1 ${analysisMode === 'local' ? 'bg-emerald-100 text-emerald-600' : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200'}`}
+              title={analysisMode === 'local' ? t.fastMode : t.aiMode}
+            >
+              <Zap size={20} />
+              <span className="text-[10px] font-bold uppercase hidden sm:inline">{analysisMode === 'local' ? 'Local' : 'AI'}</span>
+            </button>
             <button 
               onClick={toggleLanguage}
               className="p-2 bg-zinc-100 rounded-lg text-zinc-600 hover:bg-zinc-200 transition-colors flex items-center gap-1"
@@ -587,7 +707,7 @@ export default function App() {
             type="file" 
             ref={fileInputRef} 
             onChange={handleFileUpload} 
-            accept="image/*" 
+            accept="image/*,.heic,.heif" 
             className="hidden" 
           />
         </header>
@@ -595,47 +715,106 @@ export default function App() {
         {/* Main Display */}
         <div className="flex-1 flex flex-col min-h-0 bg-white rounded-3xl border border-zinc-200 shadow-sm overflow-hidden relative">
           
-          {/* Stack Visualization */}
-          <div 
-            ref={scrollRef}
-            className="flex-1 overflow-y-auto p-8 flex flex-col-reverse gap-1 scroll-smooth no-scrollbar"
-            style={{ scrollbarWidth: 'none' }}
-          >
-            <AnimatePresence initial={false}>
-              {stack.map((item, index) => (
-                <motion.div
-                  key={item.id}
-                  initial={{ opacity: 0, y: 20, scale: 0.8 }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  exit={{ opacity: 0, scale: 0.5, transition: { duration: 0.15 } }}
-                  className={`h-12 w-full rounded-lg ${item.color} shadow-sm border-b-4 border-black/10 flex items-center justify-center text-white font-mono font-bold text-lg`}
-                >
-                  {stack.length - index}
-                </motion.div>
-              ))}
-            </AnimatePresence>
-            
-            {stack.length === 0 && !isProcessing && (
-              <div className="h-full flex flex-col items-center justify-center text-zinc-300 gap-4">
-                <div className="w-24 h-24 border-2 border-dashed border-zinc-200 rounded-2xl flex items-center justify-center">
-                  <Plus size={32} />
-                </div>
-                <p className="text-sm font-medium">{t.stackEmpty}</p>
-              </div>
-            )}
+          {uploadedImage && (
+            <div className="absolute top-4 left-4 z-50 flex bg-white/80 backdrop-blur-md border border-zinc-200 rounded-lg overflow-hidden shadow-sm">
+              <button
+                onClick={() => setViewMode('stack')}
+                className={`px-3 py-1.5 text-xs font-bold flex items-center gap-1 transition-colors ${viewMode === 'stack' ? 'bg-zinc-900 text-white' : 'text-zinc-500 hover:bg-zinc-100'}`}
+              >
+                <Layers size={14} />
+                <span className="hidden sm:inline">{t.viewStack}</span>
+              </button>
+              <button
+                onClick={() => setViewMode('image')}
+                className={`px-3 py-1.5 text-xs font-bold flex items-center gap-1 transition-colors ${viewMode === 'image' ? 'bg-zinc-900 text-white' : 'text-zinc-500 hover:bg-zinc-100'}`}
+              >
+                <ImageIcon size={14} />
+                <span className="hidden sm:inline">{t.viewImage}</span>
+              </button>
+            </div>
+          )}
 
-            {isProcessing && (
-              <div className="h-full flex flex-col items-center justify-center text-emerald-500 gap-4">
-                <motion.div 
-                  animate={{ rotate: 360 }}
-                  transition={{ repeat: Infinity, duration: 1, ease: "linear" }}
-                >
-                  <Loader2 size={48} />
-                </motion.div>
-                <p className="text-sm font-bold animate-pulse">{t.aiAnalyzing}</p>
-              </div>
-            )}
-          </div>
+          {/* Stack Visualization */}
+          {viewMode === 'stack' ? (
+            <div 
+              ref={scrollRef}
+              className="flex-1 overflow-y-auto p-8 flex flex-col-reverse gap-1 scroll-smooth no-scrollbar"
+              style={{ scrollbarWidth: 'none' }}
+            >
+              <AnimatePresence initial={false}>
+                {stack.map((item, index) => (
+                  <motion.div
+                    key={item.id}
+                    initial={{ opacity: 0, y: 20, scale: 0.8 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.5, transition: { duration: 0.15 } }}
+                    className={`h-12 w-full rounded-lg ${item.color} shadow-sm border-b-4 border-black/10 flex items-center justify-center text-white font-mono font-bold text-lg`}
+                  >
+                    {stack.length - index}
+                  </motion.div>
+                ))}
+              </AnimatePresence>
+              
+              {stack.length === 0 && !isProcessing && !uploadedImage && (
+                <div className="h-full flex flex-col items-center justify-center text-zinc-300 gap-4">
+                  <div className="w-24 h-24 border-2 border-dashed border-zinc-200 rounded-2xl flex items-center justify-center">
+                    <Plus size={32} />
+                  </div>
+                  <p className="text-sm font-medium">{t.stackEmpty}</p>
+                </div>
+              )}
+
+              {isProcessing && (
+                <div className="h-full flex flex-col items-center justify-center text-emerald-500 gap-4">
+                  <motion.div 
+                    animate={{ rotate: 360 }}
+                    transition={{ repeat: Infinity, duration: 1, ease: "linear" }}
+                  >
+                    <Loader2 size={48} />
+                  </motion.div>
+                  <p className="text-sm font-bold animate-pulse">{analysisMode === 'local' ? t.localAnalyzing : t.aiAnalyzing}</p>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex-1 relative bg-zinc-900 overflow-hidden flex items-center justify-center">
+              {uploadedImage && (
+                <div className="relative w-full h-full flex items-center justify-center p-4">
+                  <img 
+                    src={uploadedImage} 
+                    alt="Analyzed" 
+                    className="max-w-full max-h-full object-contain"
+                    style={{ opacity: localResult ? 0.7 : 1 }}
+                  />
+                  {localResult && (
+                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none p-4">
+                      <div className="relative inline-block" style={{
+                        width: '100%', height: '100%', 
+                        maxWidth: '100%', maxHeight: '100%',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center'
+                      }}>
+                        <img src={uploadedImage} className="opacity-0 max-w-full max-h-full object-contain" />
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <svg width="100%" height="100%" viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute" style={{
+                            maxWidth: '100%', maxHeight: '100%', objectFit: 'contain'
+                          }}>
+                            {/* ROI Lines */}
+                            <line x1="0" y1={`${(localResult.y1 / localResult.height) * 100}`} x2="100" y2={`${(localResult.y1 / localResult.height) * 100}`} stroke="rgba(239, 68, 68, 0.8)" strokeWidth="0.5" strokeDasharray="2,2" />
+                            <line x1="0" y1={`${(localResult.y2 / localResult.height) * 100}`} x2="100" y2={`${(localResult.y2 / localResult.height) * 100}`} stroke="rgba(239, 68, 68, 0.8)" strokeWidth="0.5" strokeDasharray="2,2" />
+                            
+                            {/* Peak Lines */}
+                            {localResult.peaks.map((p, i) => (
+                              <line key={i} x1="20" y1={`${(p / localResult.height) * 100}`} x2="80" y2={`${(p / localResult.height) * 100}`} stroke="rgba(16, 185, 129, 0.8)" strokeWidth="0.3" />
+                            ))}
+                          </svg>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Counter Overlay */}
           <div className="absolute top-4 right-4 bg-white/80 backdrop-blur-md border border-zinc-200 rounded-2xl p-4 shadow-xl flex flex-col items-center min-w-[100px] z-50">
@@ -722,7 +901,7 @@ export default function App() {
         {/* Footer */}
         <footer className="mt-8 text-center">
           <p className="text-xs text-zinc-400 font-medium uppercase tracking-tighter">
-            {t.footer} • v1.0.5
+            {t.footer} • v1.0.6
           </p>
         </footer>
       </div>
@@ -826,8 +1005,76 @@ export default function App() {
                 </div>
   
                 <div className="p-6 space-y-6 overflow-y-auto custom-scrollbar">
-                  {/* Type Selector */}
-                  <div className="flex p-1 bg-zinc-100 rounded-xl">
+                  {/* Local CV Settings */}
+                  <div className="space-y-4 border-b border-zinc-100 pb-6">
+                    <h3 className="text-sm font-bold text-zinc-800 flex items-center gap-2">
+                      <Zap size={16} className="text-emerald-500" />
+                      {t.fastMode} Settings
+                    </h3>
+                    
+                    <div className="flex gap-4">
+                      <div className="flex-1">
+                        <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1 flex justify-between">
+                          <span>{t.roiStart}</span>
+                          <span className="text-emerald-600">{localParams.roiStart}</span>
+                        </label>
+                        <input 
+                          type="range" min="0" max="0.5" step="0.05" 
+                          value={localParams.roiStart}
+                          onChange={(e) => setLocalParams(prev => ({ ...prev, roiStart: parseFloat(e.target.value) }))}
+                          className="w-full accent-emerald-500"
+                        />
+                      </div>
+                      <div className="flex-1">
+                        <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1 flex justify-between">
+                          <span>{t.roiEnd}</span>
+                          <span className="text-emerald-600">{localParams.roiEnd}</span>
+                        </label>
+                        <input 
+                          type="range" min="0.5" max="1" step="0.05" 
+                          value={localParams.roiEnd}
+                          onChange={(e) => setLocalParams(prev => ({ ...prev, roiEnd: parseFloat(e.target.value) }))}
+                          className="w-full accent-emerald-500"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex gap-4">
+                      <div className="flex-1">
+                        <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1 flex justify-between">
+                          <span>{t.peakDistance}</span>
+                          <span className="text-emerald-600">{localParams.distance}</span>
+                        </label>
+                        <input 
+                          type="range" min="1" max="20" step="1" 
+                          value={localParams.distance}
+                          onChange={(e) => setLocalParams(prev => ({ ...prev, distance: parseInt(e.target.value) }))}
+                          className="w-full accent-emerald-500"
+                        />
+                      </div>
+                      <div className="flex-1">
+                        <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1 flex justify-between">
+                          <span>{t.peakProminence}</span>
+                          <span className="text-emerald-600">{localParams.prominence}</span>
+                        </label>
+                        <input 
+                          type="range" min="1" max="50" step="1" 
+                          value={localParams.prominence}
+                          onChange={(e) => setLocalParams(prev => ({ ...prev, prominence: parseInt(e.target.value) }))}
+                          className="w-full accent-emerald-500"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* AI Settings */}
+                  <div className="space-y-4">
+                    <h3 className="text-sm font-bold text-zinc-800 flex items-center gap-2">
+                      <Cpu size={16} className="text-emerald-500" />
+                      {t.aiMode} Settings
+                    </h3>
+                    {/* Type Selector */}
+                    <div className="flex p-1 bg-zinc-100 rounded-xl">
                     <button 
                       onClick={() => setModelConfig(prev => ({ ...prev, type: 'gemini' }))}
                       className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-sm font-bold transition-all ${modelConfig.type === 'gemini' ? 'bg-white shadow-sm text-emerald-600' : 'text-zinc-500 hover:text-zinc-700'}`}
@@ -900,6 +1147,7 @@ export default function App() {
                         {t.tempDesc}
                       </p>
                     </div>
+                  </div>
                   </div>
                 </div>
   
