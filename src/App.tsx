@@ -22,6 +22,13 @@ interface ModelConfig {
   temperature?: number;
 }
 
+interface LocalResult {
+  peaks: number[];
+  y1: number;
+  y2: number;
+  height: number;
+}
+
 type Language = 'en' | 'zh';
 
 const TRANSLATIONS = {
@@ -38,6 +45,7 @@ const TRANSLATIONS = {
     scanStack: 'Scan Stack',
     zoom: 'Zoom',
     saveConfig: 'SAVE CONFIGURATION',
+    exportTestImage: 'EXPORT TEST IMAGE',
     endpointUrl: 'Endpoint URL',
     apiKey: 'API Key',
     apiKeyOptional: 'Gemini API Key (Optional)',
@@ -65,7 +73,8 @@ const TRANSLATIONS = {
     roiEnd: 'ROI End',
     peakDistance: 'Peak Distance',
     peakProminence: 'Peak Prominence',
-    localAnalyzing: 'Analyzing Locally...'
+    localAnalyzing: 'Analyzing Locally...',
+    exportFailed: 'Failed to export the ROI test image.'
   },
   zh: {
     title: '层级计数器',
@@ -80,6 +89,7 @@ const TRANSLATIONS = {
     scanStack: '扫描堆栈',
     zoom: '缩放',
     saveConfig: '保存配置',
+    exportTestImage: '导出测试图',
     endpointUrl: '接口地址 (Endpoint)',
     apiKey: 'API 密钥',
     apiKeyOptional: 'Gemini API 密钥 (可选)',
@@ -107,7 +117,8 @@ const TRANSLATIONS = {
     roiEnd: '检测区域终点',
     peakDistance: '峰值间距',
     peakProminence: '峰值突起度',
-    localAnalyzing: '本地分析中...'
+    localAnalyzing: '本地分析中...',
+    exportFailed: '导出 ROI 测试图失败。'
   }
 };
 
@@ -121,6 +132,10 @@ const COLORS = [
   'bg-orange-400',
   'bg-amber-400',
 ];
+
+const ROI_HANDLE_GAP = 0.05;
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
 const compressImage = (dataUrl: string, maxWidth = 1024, maxHeight = 1024, initialQuality = 0.7): Promise<string> => {
   return new Promise((resolve, reject) => {
@@ -193,13 +208,14 @@ export default function App() {
   const [analysisMode, setAnalysisMode] = useState<'ai' | 'local'>('ai');
   const [viewMode, setViewMode] = useState<'stack' | 'image'>('stack');
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
-  const [localResult, setLocalResult] = useState<{peaks: number[], y1: number, y2: number, height: number} | null>(null);
+  const [localResult, setLocalResult] = useState<LocalResult | null>(null);
   const [localParams, setLocalParams] = useState({
-    roiStart: 0.3,
-    roiEnd: 0.7,
-    distance: 6,
-    prominence: 15
+    roiStart: 0.12,
+    roiEnd: 0.94,
+    distance: 4,
+    prominence: 6
   });
+  const [draggingHandle, setDraggingHandle] = useState<'start' | 'end' | null>(null);
   
   const [modelConfig, setModelConfig] = useState<ModelConfig>(() => {
     const saved = localStorage.getItem('stack_counter_config');
@@ -225,6 +241,7 @@ export default function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const overlayImageRef = useRef<HTMLImageElement>(null);
 
   const increment = useCallback(() => {
     const newId = Math.random().toString(36).substring(2, 9);
@@ -269,40 +286,191 @@ export default function App() {
     setStack(newStack);
   };
 
+  const exportRoiTestImage = useCallback(async () => {
+    if (!uploadedImage || !localResult) return;
+
+    try {
+      const img = new Image();
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = uploadedImage;
+      });
+
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Could not create export canvas');
+
+      ctx.drawImage(img, 0, 0);
+
+      ctx.strokeStyle = '#ff2d2d';
+      ctx.lineWidth = Math.max(3, Math.round(img.height / 220));
+      ctx.setLineDash([]);
+
+      const drawBoundary = (y: number) => {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(img.width, y);
+        ctx.stroke();
+      };
+
+      drawBoundary(localResult.y1);
+      drawBoundary(localResult.y2);
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const link = document.createElement('a');
+      link.href = canvas.toDataURL('image/png');
+      link.download = `stack-counter-roi-test-${timestamp}.png`;
+      link.click();
+    } catch (err) {
+      console.error('Export ROI test image failed:', err);
+      setError(t.exportFailed);
+    }
+  }, [localResult, t.exportFailed, uploadedImage]);
+
+  const runLocalAnalysis = useCallback(async (base64Data: string) => {
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = reject;
+      img.src = base64Data;
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error("Could not get canvas context");
+
+    ctx.drawImage(img, 0, 0);
+    const imageData = ctx.getImageData(0, 0, img.width, img.height);
+
+    const result = analyzeImageLocal(
+      imageData,
+      [localParams.roiStart, localParams.roiEnd],
+      localParams.distance,
+      localParams.prominence
+    );
+
+    setLocalResult({
+      peaks: result.peaks,
+      y1: result.y1,
+      y2: result.y2,
+      height: result.height
+    });
+    updateStackCount(result.count);
+    setViewMode('image');
+    return result;
+  }, [localParams]);
+
+  useEffect(() => {
+    if (analysisMode !== 'local' || !uploadedImage || localResult === null) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      runLocalAnalysis(uploadedImage).catch((err: any) => {
+        console.error("Local Analysis Error:", err);
+        setError(err?.message || t.analysisFailed);
+      });
+    }, 80);
+
+    return () => window.clearTimeout(timer);
+  }, [analysisMode, uploadedImage, localParams, runLocalAnalysis, t.analysisFailed]);
+
+  const updateRoiHandle = useCallback((clientY: number, handle: 'start' | 'end') => {
+    const image = overlayImageRef.current;
+    if (!image) return;
+
+    const rect = image.getBoundingClientRect();
+    if (rect.height <= 0) return;
+
+    const ratio = clamp((clientY - rect.top) / rect.height, 0, 1);
+
+    setLocalParams(prev => {
+      if (handle === 'start') {
+        return {
+          ...prev,
+          roiStart: clamp(ratio, 0, prev.roiEnd - ROI_HANDLE_GAP)
+        };
+      }
+
+      return {
+        ...prev,
+        roiEnd: clamp(ratio, prev.roiStart + ROI_HANDLE_GAP, 1)
+      };
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!draggingHandle) {
+      return;
+    }
+
+    const handlePointerMove = (event: PointerEvent) => {
+      updateRoiHandle(event.clientY, draggingHandle);
+    };
+
+    const stopDragging = () => {
+      setDraggingHandle(null);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', stopDragging);
+    window.addEventListener('pointercancel', stopDragging);
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', stopDragging);
+      window.removeEventListener('pointercancel', stopDragging);
+    };
+  }, [draggingHandle, updateRoiHandle]);
+
   const analyzeImage = async (base64Data: string) => {
     setIsProcessing(true);
     setError(null);
     setUploadedImage(base64Data);
     
     try {
-      if (analysisMode === 'local') {
-        const img = new Image();
-        await new Promise((resolve, reject) => {
-          img.onload = resolve;
-          img.onerror = reject;
-          img.src = base64Data;
+      // Always run local analysis first to check for red boundary lines
+      const img = new Image();
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = base64Data;
+      });
+
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error("Could not get canvas context");
+
+      ctx.drawImage(img, 0, 0);
+      const imageData = ctx.getImageData(0, 0, img.width, img.height);
+
+      const localRes = analyzeImageLocal(
+        imageData,
+        [localParams.roiStart, localParams.roiEnd],
+        localParams.distance,
+        localParams.prominence
+      );
+
+      // If red lines are detected, OR if we are already in local mode, use the local result
+      if (localRes.boundarySource === 'red_lines' || analysisMode === 'local') {
+        if (localRes.boundarySource === 'red_lines' && analysisMode !== 'local') {
+          setAnalysisMode('local'); // Auto-switch to local mode
+        }
+        setLocalResult({
+          peaks: localRes.peaks,
+          y1: localRes.y1,
+          y2: localRes.y2,
+          height: localRes.height
         });
-        
-        const canvas = document.createElement('canvas');
-        canvas.width = img.width;
-        canvas.height = img.height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) throw new Error("Could not get canvas context");
-        
-        ctx.drawImage(img, 0, 0);
-        const imageData = ctx.getImageData(0, 0, img.width, img.height);
-        
-        const result = analyzeImageLocal(
-          imageData, 
-          [localParams.roiStart, localParams.roiEnd], 
-          localParams.distance, 
-          localParams.prominence
-        );
-        
-        setLocalResult({ peaks: result.peaks, y1: result.y1, y2: result.y2, height: result.height });
-        updateStackCount(result.count);
+        updateStackCount(localRes.count);
         setViewMode('image');
-        setIsProcessing(false);
         return;
       }
 
@@ -716,21 +884,32 @@ export default function App() {
         <div className="flex-1 flex flex-col min-h-0 bg-white rounded-3xl border border-zinc-200 shadow-sm overflow-hidden relative">
           
           {uploadedImage && (
-            <div className="absolute top-4 left-4 z-50 flex bg-white/80 backdrop-blur-md border border-zinc-200 rounded-lg overflow-hidden shadow-sm">
-              <button
-                onClick={() => setViewMode('stack')}
-                className={`px-3 py-1.5 text-xs font-bold flex items-center gap-1 transition-colors ${viewMode === 'stack' ? 'bg-zinc-900 text-white' : 'text-zinc-500 hover:bg-zinc-100'}`}
-              >
-                <Layers size={14} />
-                <span className="hidden sm:inline">{t.viewStack}</span>
-              </button>
-              <button
-                onClick={() => setViewMode('image')}
-                className={`px-3 py-1.5 text-xs font-bold flex items-center gap-1 transition-colors ${viewMode === 'image' ? 'bg-zinc-900 text-white' : 'text-zinc-500 hover:bg-zinc-100'}`}
-              >
-                <ImageIcon size={14} />
-                <span className="hidden sm:inline">{t.viewImage}</span>
-              </button>
+            <div className="absolute top-4 left-4 z-50 flex items-center gap-3">
+              <div className="flex bg-white/80 backdrop-blur-md border border-zinc-200 rounded-lg overflow-hidden shadow-sm">
+                <button
+                  onClick={() => setViewMode('stack')}
+                  className={`px-3 py-1.5 text-xs font-bold flex items-center gap-1 transition-colors ${viewMode === 'stack' ? 'bg-zinc-900 text-white' : 'text-zinc-500 hover:bg-zinc-100'}`}
+                >
+                  <Layers size={14} />
+                  <span className="hidden sm:inline">{t.viewStack}</span>
+                </button>
+                <button
+                  onClick={() => setViewMode('image')}
+                  className={`px-3 py-1.5 text-xs font-bold flex items-center gap-1 transition-colors ${viewMode === 'image' ? 'bg-zinc-900 text-white' : 'text-zinc-500 hover:bg-zinc-100'}`}
+                >
+                  <ImageIcon size={14} />
+                  <span className="hidden sm:inline">{t.viewImage}</span>
+                </button>
+              </div>
+              {localResult && (
+                <button
+                  onClick={exportRoiTestImage}
+                  className="px-3 py-1.5 text-xs font-bold flex items-center gap-2 bg-white/80 backdrop-blur-md border border-zinc-200 rounded-lg shadow-sm text-zinc-700 hover:bg-white transition-colors"
+                >
+                  <Save size={14} />
+                  <span className="hidden sm:inline">{t.exportTestImage}</span>
+                </button>
+              )}
             </div>
           )}
 
@@ -780,37 +959,58 @@ export default function App() {
             <div className="flex-1 relative bg-zinc-900 overflow-hidden flex items-center justify-center">
               {uploadedImage && (
                 <div className="relative w-full h-full flex items-center justify-center p-4">
-                  <img 
-                    src={uploadedImage} 
-                    alt="Analyzed" 
-                    className="max-w-full max-h-full object-contain"
-                    style={{ opacity: localResult ? 0.7 : 1 }}
-                  />
-                  {localResult && (
-                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none p-4">
-                      <div className="relative inline-block" style={{
-                        width: '100%', height: '100%', 
-                        maxWidth: '100%', maxHeight: '100%',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center'
-                      }}>
-                        <img src={uploadedImage} className="opacity-0 max-w-full max-h-full object-contain" />
-                        <div className="absolute inset-0 flex items-center justify-center">
-                          <svg width="100%" height="100%" viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute" style={{
-                            maxWidth: '100%', maxHeight: '100%', objectFit: 'contain'
-                          }}>
-                            {/* ROI Lines */}
-                            <line x1="0" y1={`${(localResult.y1 / localResult.height) * 100}`} x2="100" y2={`${(localResult.y1 / localResult.height) * 100}`} stroke="rgba(239, 68, 68, 0.8)" strokeWidth="0.5" strokeDasharray="2,2" />
-                            <line x1="0" y1={`${(localResult.y2 / localResult.height) * 100}`} x2="100" y2={`${(localResult.y2 / localResult.height) * 100}`} stroke="rgba(239, 68, 68, 0.8)" strokeWidth="0.5" strokeDasharray="2,2" />
-                            
-                            {/* Peak Lines */}
-                            {localResult.peaks.map((p, i) => (
-                              <line key={i} x1="20" y1={`${(p / localResult.height) * 100}`} x2="80" y2={`${(p / localResult.height) * 100}`} stroke="rgba(16, 185, 129, 0.8)" strokeWidth="0.3" />
-                            ))}
-                          </svg>
-                        </div>
-                      </div>
-                    </div>
-                  )}
+                  <div className="relative inline-block max-w-full max-h-full">
+                    <img
+                      ref={overlayImageRef}
+                      src={uploadedImage}
+                      alt="Analyzed"
+                      className="max-w-full max-h-[calc(100vh-12rem)] object-contain select-none"
+                      draggable={false}
+                      style={{ opacity: localResult ? 0.72 : 1 }}
+                    />
+                    {localResult && (
+                      <svg
+                        width="100%"
+                        height="100%"
+                        viewBox="0 0 100 100"
+                        preserveAspectRatio="none"
+                        className="absolute inset-0 touch-none"
+                      >
+                        <rect x="0" y={`${(localResult.y1 / localResult.height) * 100}`} width="100" height={`${((localResult.y2 - localResult.y1) / localResult.height) * 100}`} fill="rgba(239, 68, 68, 0.08)" />
+
+                        <line x1="0" y1={`${(localResult.y1 / localResult.height) * 100}`} x2="100" y2={`${(localResult.y1 / localResult.height) * 100}`} stroke="rgba(239, 68, 68, 0.9)" strokeWidth="0.6" strokeDasharray="2,2" />
+                        <line x1="0" y1={`${(localResult.y2 / localResult.height) * 100}`} x2="100" y2={`${(localResult.y2 / localResult.height) * 100}`} stroke="rgba(239, 68, 68, 0.9)" strokeWidth="0.6" strokeDasharray="2,2" />
+
+                        {localResult.peaks.map((p, i) => (
+                          <line key={i} x1="20" y1={`${(p / localResult.height) * 100}`} x2="80" y2={`${(p / localResult.height) * 100}`} stroke="rgba(16, 185, 129, 0.85)" strokeWidth="0.3" />
+                        ))}
+
+                        <g
+                          className="cursor-ns-resize"
+                          onPointerDown={(event) => {
+                            event.preventDefault();
+                            setDraggingHandle('start');
+                            updateRoiHandle(event.clientY, 'start');
+                          }}
+                        >
+                          <line x1="0" y1={`${(localResult.y1 / localResult.height) * 100}`} x2="100" y2={`${(localResult.y1 / localResult.height) * 100}`} stroke="transparent" strokeWidth="5" />
+                          <circle cx="92" cy={`${(localResult.y1 / localResult.height) * 100}`} r="2.2" fill="#ef4444" stroke="white" strokeWidth="0.5" />
+                        </g>
+
+                        <g
+                          className="cursor-ns-resize"
+                          onPointerDown={(event) => {
+                            event.preventDefault();
+                            setDraggingHandle('end');
+                            updateRoiHandle(event.clientY, 'end');
+                          }}
+                        >
+                          <line x1="0" y1={`${(localResult.y2 / localResult.height) * 100}`} x2="100" y2={`${(localResult.y2 / localResult.height) * 100}`} stroke="transparent" strokeWidth="5" />
+                          <circle cx="92" cy={`${(localResult.y2 / localResult.height) * 100}`} r="2.2" fill="#ef4444" stroke="white" strokeWidth="0.5" />
+                        </g>
+                      </svg>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
