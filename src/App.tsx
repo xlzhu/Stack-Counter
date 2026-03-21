@@ -103,6 +103,50 @@ const COLORS = [
   'bg-amber-400',
 ];
 
+const compressImage = (dataUrl: string, maxWidth = 1024, maxHeight = 1024, initialQuality = 0.7): Promise<string> => {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      let width = img.width;
+      let height = img.height;
+
+      if (width > height) {
+        if (width > maxWidth) {
+          height = Math.round((height * maxWidth) / width);
+          width = maxWidth;
+        }
+      } else {
+        if (height > maxHeight) {
+          width = Math.round((width * maxHeight) / height);
+          height = maxHeight;
+        }
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(img, 0, 0, width, height);
+        let quality = initialQuality;
+        let compressed = canvas.toDataURL('image/jpeg', quality);
+        
+        // Ensure the base64 string is under ~1.5MB (approx 1MB actual size)
+        while (compressed.length > 1500000 && quality > 0.1) {
+          quality -= 0.1;
+          compressed = canvas.toDataURL('image/jpeg', quality);
+        }
+        
+        resolve(compressed);
+      } else {
+        resolve(dataUrl);
+      }
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+};
+
 export default function App() {
   const [language, setLanguage] = useState<Language>(() => {
     const saved = localStorage.getItem('stack_counter_lang');
@@ -240,13 +284,96 @@ export default function App() {
         if (!modelConfig.endpoint) throw new Error("Custom endpoint URL is required");
         
         let finalEndpoint = modelConfig.endpoint.trim();
-        // Automatically append /chat/completions if only base URL is provided
-        if (!finalEndpoint.endsWith('/chat/completions')) {
-          finalEndpoint = finalEndpoint.replace(/\/$/, '') + '/chat/completions';
+        const isNvidia = finalEndpoint.includes('nvidia.com') || finalEndpoint.includes('localhost') || finalEndpoint.includes('127.0.0.1');
+        const isNvidiaCv = isNvidia && (finalEndpoint.includes('/cv/') || modelConfig.modelName?.toLowerCase().includes('ocr') || modelConfig.modelName?.toLowerCase().includes('cv'));
+
+        try {
+          const urlObj = new URL(finalEndpoint);
+          if (isNvidiaCv) {
+            // For NVIDIA CV models, if it's a base URL, append /v1/infer
+            if (urlObj.pathname === '/' || urlObj.pathname === '/v1' || urlObj.pathname === '/v1/') {
+              finalEndpoint = finalEndpoint.replace(/\/$/, '') + '/v1/infer';
+            }
+          } else {
+            // Only append /chat/completions if it looks like a base URL (e.g., ends with /v1 or has no specific path)
+            if (!finalEndpoint.endsWith('/chat/completions') && 
+                (urlObj.pathname === '/v1' || urlObj.pathname === '/v1/' || urlObj.pathname === '/')) {
+              finalEndpoint = finalEndpoint.replace(/\/$/, '') + '/chat/completions';
+            }
+          }
+        } catch (e) {
+          // Fallback if URL parsing fails
+          if (!isNvidiaCv && !finalEndpoint.endsWith('/chat/completions')) {
+            finalEndpoint = finalEndpoint.replace(/\/$/, '') + '/chat/completions';
+          }
         }
         
         const apiKey = modelConfig.apiKey?.trim() || '';
         if (!apiKey) throw new Error("API Key is required for Custom API mode.");
+        
+        let payload: any;
+        const modelName = modelConfig.modelName || (isNvidia ? (finalEndpoint.split('/').pop() || 'nvidia/nemotron-ocr-v1') : 'gpt-4o');
+        const isMultimodal = !modelName.includes('nemotron-3-super') && !modelName.includes('qwen3.5-122b');
+        
+        if (isNvidiaCv) {
+          // NVIDIA CV-specific API format (e.g., nemotron-ocr-v1)
+          // Requires an "input" wrapper as a list
+          payload = {
+            input: [
+              {
+                type: 'image_url',
+                url: base64Data
+              }
+            ],
+            merge_levels: ['paragraph']
+          };
+        } else {
+          // Standard OpenAI-compatible Chat format
+          payload = {
+            model: modelName,
+            messages: [
+              {
+                role: 'user',
+                content: isMultimodal ? [
+                  { type: 'text', text: isNvidia ? `${systemInstruction}\n\n${promptText}` : promptText },
+                  {
+                    type: 'image_url',
+                    image_url: { url: base64Data }
+                  }
+                ] : (isNvidia ? `${systemInstruction}\n\n${promptText}` : promptText)
+              }
+            ],
+            temperature: modelConfig.temperature ?? 1,
+            max_tokens: 1024
+          };
+
+          if (!isNvidia && isMultimodal) {
+            payload.messages.unshift({ role: 'system', content: systemInstruction });
+          }
+
+          // Special handling for Nemotron-3 Super with thinking capabilities
+          if (modelName.includes('nemotron-3-super')) {
+            payload.chat_template_kwargs = { enable_thinking: true };
+            payload.reasoning_budget = 16384;
+            payload.max_tokens = 16384;
+            payload.top_p = 0.95;
+          }
+
+          // Special handling for Gemma 3
+          if (modelName.includes('gemma-3')) {
+            payload.temperature = modelConfig.temperature ?? 0.20;
+            payload.top_p = 0.70;
+            payload.max_tokens = 512;
+          }
+
+          // Special handling for Qwen 3.5 122b with thinking capabilities
+          if (modelName.includes('qwen3.5-122b')) {
+            payload.chat_template_kwargs = { enable_thinking: true };
+            payload.max_tokens = 16384;
+            payload.temperature = modelConfig.temperature ?? 0.60;
+            payload.top_p = 0.95;
+          }
+        }
 
         const response = await fetch('/api/proxy/llm', {
           method: 'POST',
@@ -256,32 +383,18 @@ export default function App() {
           body: JSON.stringify({
             endpoint: finalEndpoint,
             apiKey: apiKey,
-            body: {
-              model: modelConfig.modelName || 'gpt-4o',
-              messages: [
-                { role: 'system', content: systemInstruction },
-                {
-                  role: 'user',
-                  content: [
-                    { type: 'text', text: promptText },
-                    {
-                      type: 'image_url',
-                      image_url: { url: base64Data }
-                    }
-                  ]
-                }
-              ],
-              temperature: modelConfig.temperature ?? 1
-            }
+            body: payload
           })
         });
 
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));
           const errorObj = errorData.error || errorData;
-          let errorMessage = errorObj.message || errorObj.type || (typeof errorData === 'string' ? errorData : null);
+          let errorMessage = errorObj.message || errorObj.detail || errorObj.type || (typeof errorData === 'string' ? errorData : null);
           
-          if (errorObj.type === 'access_terminated_error') {
+          if (response.status === 422) {
+            errorMessage = `API Error 422: Invalid request format. For NVIDIA CV models, ensure the URL is correct. Details: ${JSON.stringify(errorObj)}`;
+          } else if (errorObj.type === 'access_terminated_error') {
             errorMessage = "API Access Terminated: Your API key or account has been disabled by the provider. Please check your account status.";
           } else if (errorObj.type === 'insufficient_quota' || errorObj.code === 'insufficient_quota') {
             errorMessage = "Insufficient Quota: Your API account has run out of credits or reached its limit.";
@@ -291,8 +404,38 @@ export default function App() {
         }
 
         const data = await response.json();
-        const resultText = data.choices?.[0]?.message?.content?.trim() || "0";
-        count = parseInt(resultText.replace(/[^0-9]/g, ''), 10);
+        
+        let resultText = "";
+        if (isNvidiaCv) {
+          // NVIDIA CV API usually returns { "content": "..." } or { "text": "..." }
+          // Or a nested structure: { "data": [ { "text_detections": [ { "text_prediction": { "text": "..." } } ] } ] }
+          if (data.data && Array.isArray(data.data)) {
+            let combinedText = "";
+            for (const detection of data.data) {
+              if (detection.text_detections && Array.isArray(detection.text_detections)) {
+                for (const textDet of detection.text_detections) {
+                  if (textDet.text_prediction && textDet.text_prediction.text) {
+                    combinedText += textDet.text_prediction.text + " ";
+                  }
+                }
+              }
+            }
+            resultText = combinedText.trim();
+          } else {
+            resultText = data.content || data.text || data.description || "";
+          }
+        } else {
+          // Standard Chat API
+          const message = data.choices?.[0]?.message;
+          resultText = message?.content || "";
+          
+          // If there is reasoning content, log it for debugging
+          if (message?.reasoning_content) {
+            console.log("Nemotron Reasoning:", message.reasoning_content);
+          }
+        }
+        
+        count = parseInt(resultText.trim().replace(/[^0-9]/g, ''), 10);
       }
       
       if (!isNaN(count)) {
@@ -302,7 +445,11 @@ export default function App() {
       }
     } catch (err: any) {
       console.error("AI Analysis Error:", err);
-      setError(err.message || t.analysisFailed);
+      let errorMessage = err.message || t.analysisFailed;
+      if (errorMessage.includes('Rpc failed due to xhr error')) {
+        errorMessage = language === 'zh' ? '图片体积仍然过大，请尝试截取局部图片或使用更低分辨率的照片。' : 'Image size is still too large. Please try cropping the image or using a lower resolution photo.';
+      }
+      setError(errorMessage);
     } finally {
       setIsProcessing(false);
       setIsCameraActive(false);
@@ -355,16 +502,17 @@ export default function App() {
     setIsCameraActive(false);
   };
 
-  const captureImage = () => {
+  const captureImage = async () => {
     if (videoRef.current && canvasRef.current) {
       const context = canvasRef.current.getContext('2d');
       if (context) {
         canvasRef.current.width = videoRef.current.videoWidth;
         canvasRef.current.height = videoRef.current.videoHeight;
         context.drawImage(videoRef.current, 0, 0);
-        const base64Data = canvasRef.current.toDataURL('image/jpeg');
+        const base64Data = canvasRef.current.toDataURL('image/jpeg', 0.85);
         stopCamera();
-        analyzeImage(base64Data);
+        const compressedDataUrl = await compressImage(base64Data);
+        analyzeImage(compressedDataUrl);
       }
     }
   };
@@ -373,8 +521,9 @@ export default function App() {
     const file = e.target.files?.[0];
     if (file) {
       const reader = new FileReader();
-      reader.onloadend = () => {
-        analyzeImage(reader.result as string);
+      reader.onloadend = async () => {
+        const compressedDataUrl = await compressImage(reader.result as string);
+        analyzeImage(compressedDataUrl);
         // Clear the input value so the same file can be uploaded again
         if (fileInputRef.current) {
           fileInputRef.current.value = "";
