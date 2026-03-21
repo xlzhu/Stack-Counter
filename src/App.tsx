@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Plus, Minus, RotateCcw, Layers, Camera, Upload, Loader2, X, Check, Settings, Globe, Cpu, Save } from 'lucide-react';
+import { Plus, Minus, RotateCcw, Layers, Camera, Upload, Loader2, X, Check, Settings, Globe, Cpu, Save, Languages } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 
 interface StackItem {
@@ -21,6 +21,77 @@ interface ModelConfig {
   temperature?: number;
 }
 
+type Language = 'en' | 'zh';
+
+const TRANSLATIONS = {
+  en: {
+    title: 'Stack-Counter',
+    modelSettings: 'Model Settings',
+    uploadPhoto: 'Upload Photo',
+    scanCamera: 'Scan with Camera',
+    stackEmpty: 'Stack is empty',
+    aiAnalyzing: 'AI Analyzing Layers...',
+    total: 'Total',
+    adjust: 'ADJUST',
+    resetStack: 'RESET STACK',
+    scanStack: 'Scan Stack',
+    zoom: 'Zoom',
+    saveConfig: 'SAVE CONFIGURATION',
+    endpointUrl: 'Endpoint URL',
+    apiKey: 'API Key',
+    apiKeyOptional: 'Gemini API Key (Optional)',
+    modelName: 'Model Name',
+    temperature: 'Temperature',
+    tempDesc: 'Lower values are more deterministic, higher values more creative.',
+    gemini: 'Gemini',
+    customApi: 'Custom API',
+    leaveEmpty: 'Leave empty to use system key',
+    placeholderEndpoint: 'https://api.openai.com/v1',
+    placeholderModel: 'gemini-3.1-pro-preview',
+    placeholderCustomModel: 'gpt-4o',
+    errorDetermining: 'Could not determine count. Please try again.',
+    errorCamera: 'Could not access camera. Please check permissions.',
+    analysisFailed: 'Analysis failed. Please check your connection or image quality.',
+    footer: 'AI-Powered Layer Detection',
+    promptText: "Methodically count the number of thin stacked layers in this image (e.g., stacked trays). These layers are very dense. First, identify the boundaries of the stack. Then, count each individual layer by looking at the distinct horizontal lines on the vertical edges. Be extremely precise and do not skip any layers. Return ONLY the final integer count.",
+    systemInstruction: "You are a precision counting expert. ",
+    manualCountNote: "Note: For a similar stack, a manual count of {count} was previously recorded. Use this as a reference but verify the current image exactly. "
+  },
+  zh: {
+    title: '层级计数器',
+    modelSettings: '模型设置',
+    uploadPhoto: '上传照片',
+    scanCamera: '相机扫描',
+    stackEmpty: '堆栈为空',
+    aiAnalyzing: 'AI 正在分析层级...',
+    total: '总计',
+    adjust: '调整',
+    resetStack: '重置堆栈',
+    scanStack: '扫描堆栈',
+    zoom: '缩放',
+    saveConfig: '保存配置',
+    endpointUrl: '接口地址 (Endpoint)',
+    apiKey: 'API 密钥',
+    apiKeyOptional: 'Gemini API 密钥 (可选)',
+    modelName: '模型名称',
+    temperature: '温度 (Temperature)',
+    tempDesc: '较低的值更具确定性，较高的值更具创造性。',
+    gemini: 'Gemini',
+    customApi: '自定义 API',
+    leaveEmpty: '留空则使用系统默认密钥',
+    placeholderEndpoint: 'https://api.openai.com/v1',
+    placeholderModel: 'gemini-3.1-pro-preview',
+    placeholderCustomModel: 'gpt-4o',
+    errorDetermining: '无法确定数量，请重试。',
+    errorCamera: '无法访问相机，请检查权限。',
+    analysisFailed: '分析失败，请检查网络连接或图像质量。',
+    footer: 'AI 驱动的层级检测',
+    promptText: "有条理地计算这张图片中薄堆叠层的数量（例如，堆叠的托盘）。这些层非常密集。首先，识别堆栈的边界。然后，通过观察垂直边缘上明显的水平线来计算每个单独的层。请务必极其精确，不要跳过任何层。仅返回最终的整数计数。",
+    systemInstruction: "你是一个精准计数专家。",
+    manualCountNote: "注意：对于类似的堆栈，之前记录的手动计数为 {count}。请将其作为参考，但要准确核实当前图像。"
+  }
+};
+
 const COLORS = [
   'bg-emerald-400',
   'bg-sky-400',
@@ -33,6 +104,22 @@ const COLORS = [
 ];
 
 export default function App() {
+  const [language, setLanguage] = useState<Language>(() => {
+    const saved = localStorage.getItem('stack_counter_lang');
+    if (saved === 'en' || saved === 'zh') return saved;
+    return navigator.language.startsWith('zh') ? 'zh' : 'en';
+  });
+
+  useEffect(() => {
+    localStorage.setItem('stack_counter_lang', language);
+  }, [language]);
+
+  const t = useMemo(() => TRANSLATIONS[language], [language]);
+
+  const toggleLanguage = () => {
+    setLanguage(prev => prev === 'en' ? 'zh' : 'en');
+  };
+
   const [stack, setStack] = useState<StackItem[]>([]);
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [zoom, setZoom] = useState(1);
@@ -110,9 +197,9 @@ export default function App() {
     setIsProcessing(true);
     setError(null);
     try {
-      const promptText = "Methodically count the number of thin stacked layers in this image (e.g., stacked trays). These layers are very dense. First, identify the boundaries of the stack. Then, count each individual layer by looking at the distinct horizontal lines on the vertical edges. Be extremely precise and do not skip any layers. Return ONLY the final integer count.";
-      const systemInstruction = "You are a precision counting expert. " + 
-        (lastManualCount ? `Note: For a similar stack, a manual count of ${lastManualCount} was previously recorded. Use this as a reference but verify the current image exactly. ` : "") +
+      const promptText = t.promptText;
+      const systemInstruction = t.systemInstruction + 
+        (lastManualCount ? t.manualCountNote.replace('{count}', lastManualCount.toString()) : "") +
         "Count each individual layer by looking at the distinct horizontal lines on the vertical edges. Be extremely precise and do not skip any layers. Return ONLY the final integer count.";
 
       let count = 0;
@@ -211,11 +298,11 @@ export default function App() {
       if (!isNaN(count)) {
         updateStackCount(count);
       } else {
-        setError("Could not determine count. Please try again.");
+        setError(t.errorDetermining);
       }
     } catch (err: any) {
       console.error("AI Analysis Error:", err);
-      setError(err.message || "Analysis failed. Please check your connection or image quality.");
+      setError(err.message || t.analysisFailed);
     } finally {
       setIsProcessing(false);
       setIsCameraActive(false);
@@ -249,7 +336,7 @@ export default function App() {
           }
         } catch (err) {
           console.error("Camera Error:", err);
-          setError("Could not access camera. Please check permissions.");
+          setError(t.errorCamera);
           setIsCameraActive(false);
         }
       }
@@ -314,27 +401,35 @@ export default function App() {
             <div className="p-2 bg-zinc-900 rounded-lg text-white">
               <Layers size={20} />
             </div>
-            <h1 className="text-xl font-bold tracking-tight">Stack-Counter</h1>
+            <h1 className="text-xl font-bold tracking-tight">{t.title}</h1>
           </div>
           <div className="flex gap-2">
             <button 
+              onClick={toggleLanguage}
+              className="p-2 bg-zinc-100 rounded-lg text-zinc-600 hover:bg-zinc-200 transition-colors flex items-center gap-1"
+              title={language === 'en' ? 'Switch to Chinese' : '切换至英文'}
+            >
+              <Languages size={20} />
+              <span className="text-[10px] font-bold uppercase">{language}</span>
+            </button>
+            <button 
               onClick={() => setIsSettingsOpen(true)}
               className="p-2 bg-zinc-100 rounded-lg text-zinc-600 hover:bg-zinc-200 transition-colors"
-              title="Model Settings"
+              title={t.modelSettings}
             >
               <Settings size={20} />
             </button>
             <button 
               onClick={() => fileInputRef.current?.click()}
               className="p-2 bg-zinc-100 rounded-lg text-zinc-600 hover:bg-zinc-200 transition-colors"
-              title="Upload Photo"
+              title={t.uploadPhoto}
             >
               <Upload size={20} />
             </button>
             <button 
               onClick={startCamera}
               className="p-2 bg-zinc-100 rounded-lg text-zinc-600 hover:bg-zinc-200 transition-colors"
-              title="Scan with Camera"
+              title={t.scanCamera}
             >
               <Camera size={20} />
             </button>
@@ -376,7 +471,7 @@ export default function App() {
                 <div className="w-24 h-24 border-2 border-dashed border-zinc-200 rounded-2xl flex items-center justify-center">
                   <Plus size={32} />
                 </div>
-                <p className="text-sm font-medium">Stack is empty</p>
+                <p className="text-sm font-medium">{t.stackEmpty}</p>
               </div>
             )}
 
@@ -388,14 +483,14 @@ export default function App() {
                 >
                   <Loader2 size={48} />
                 </motion.div>
-                <p className="text-sm font-bold animate-pulse">AI Analyzing Layers...</p>
+                <p className="text-sm font-bold animate-pulse">{t.aiAnalyzing}</p>
               </div>
             )}
           </div>
 
           {/* Counter Overlay */}
           <div className="absolute top-4 right-4 bg-white/80 backdrop-blur-md border border-zinc-200 rounded-2xl p-4 shadow-xl flex flex-col items-center min-w-[100px] z-50">
-            <span className="text-xs font-bold text-zinc-400 uppercase tracking-widest mb-1">Total</span>
+            <span className="text-xs font-bold text-zinc-400 uppercase tracking-widest mb-1">{t.total}</span>
             <div className="flex flex-col items-center gap-1">
               {isAdjusting ? (
                 <div className="flex flex-col items-center gap-2">
@@ -439,7 +534,7 @@ export default function App() {
                     }}
                     className="text-[10px] font-bold text-emerald-600 hover:underline px-2 py-1 cursor-pointer"
                   >
-                    ADJUST
+                    {t.adjust}
                   </button>
                 </>
               )}
@@ -468,17 +563,17 @@ export default function App() {
             onClick={reset}
             disabled={stack.length === 0 || isProcessing}
             className="w-full flex items-center justify-center gap-2 p-4 rounded-2xl bg-zinc-100 text-zinc-600 hover:bg-zinc-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-bold"
-            title="Reset"
+            title={t.resetStack}
           >
             <RotateCcw size={24} />
-            <span>RESET STACK</span>
+            <span>{t.resetStack}</span>
           </button>
         </div>
 
         {/* Footer */}
         <footer className="mt-8 text-center">
           <p className="text-xs text-zinc-400 font-medium uppercase tracking-tighter">
-            AI-Powered Layer Detection • v1.0.3
+            {t.footer} • v1.0.3
           </p>
         </footer>
       </div>
@@ -493,7 +588,7 @@ export default function App() {
             className="fixed inset-0 z-50 bg-black flex flex-col"
           >
             <div className="p-4 flex justify-between items-center text-white">
-              <h2 className="font-bold">Scan Stack</h2>
+              <h2 className="font-bold">{t.scanStack}</h2>
               <button onClick={stopCamera} className="p-2 bg-white/10 rounded-full">
                 <X size={24} />
               </button>
@@ -574,7 +669,7 @@ export default function App() {
                 <div className="p-6 border-b border-zinc-100 flex justify-between items-center shrink-0">
                   <div className="flex items-center gap-2">
                     <Settings className="text-zinc-400" size={20} />
-                    <h2 className="font-bold text-lg">Model Settings</h2>
+                    <h2 className="font-bold text-lg">{t.modelSettings}</h2>
                   </div>
                   <button onClick={() => setIsSettingsOpen(false)} className="p-2 hover:bg-zinc-100 rounded-full transition-colors">
                     <X size={20} />
@@ -589,24 +684,24 @@ export default function App() {
                       className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-sm font-bold transition-all ${modelConfig.type === 'gemini' ? 'bg-white shadow-sm text-emerald-600' : 'text-zinc-500 hover:text-zinc-700'}`}
                     >
                       <Cpu size={16} />
-                      Gemini
+                      {t.gemini}
                     </button>
                     <button 
                       onClick={() => setModelConfig(prev => ({ ...prev, type: 'custom' }))}
                       className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-sm font-bold transition-all ${modelConfig.type === 'custom' ? 'bg-white shadow-sm text-emerald-600' : 'text-zinc-500 hover:text-zinc-700'}`}
                     >
                       <Globe size={16} />
-                      Custom API
+                      {t.customApi}
                     </button>
                   </div>
   
                   <div className="space-y-4">
                     {modelConfig.type === 'custom' && (
                       <div>
-                        <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">Endpoint URL</label>
+                        <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">{t.endpointUrl}</label>
                         <input 
                           type="text"
-                          placeholder="https://api.openai.com/v1"
+                          placeholder={t.placeholderEndpoint}
                           value={modelConfig.endpoint || ''}
                           onChange={(e) => setModelConfig(prev => ({ ...prev, endpoint: e.target.value }))}
                           className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
@@ -616,11 +711,11 @@ export default function App() {
                     
                     <div>
                       <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">
-                        {modelConfig.type === 'gemini' ? 'Gemini API Key (Optional)' : 'API Key'}
+                        {modelConfig.type === 'gemini' ? t.apiKeyOptional : t.apiKey}
                       </label>
                       <input 
                         type="password"
-                        placeholder={modelConfig.type === 'gemini' ? 'Leave empty to use system key' : 'sk-...'}
+                        placeholder={modelConfig.type === 'gemini' ? t.leaveEmpty : 'sk-...'}
                         value={modelConfig.apiKey || ''}
                         onChange={(e) => setModelConfig(prev => ({ ...prev, apiKey: e.target.value }))}
                         className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
@@ -628,10 +723,10 @@ export default function App() {
                     </div>
   
                     <div>
-                      <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">Model Name</label>
+                      <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1">{t.modelName}</label>
                       <input 
                         type="text"
-                        placeholder={modelConfig.type === 'gemini' ? 'gemini-3.1-pro-preview' : 'gpt-4o'}
+                        placeholder={modelConfig.type === 'gemini' ? t.placeholderModel : t.placeholderCustomModel}
                         value={modelConfig.modelName || ''}
                         onChange={(e) => setModelConfig(prev => ({ ...prev, modelName: e.target.value }))}
                         className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
@@ -640,7 +735,7 @@ export default function App() {
   
                     <div>
                       <label className="block text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-1.5 ml-1 flex justify-between">
-                        <span>Temperature</span>
+                        <span>{t.temperature}</span>
                         <span className="text-emerald-600">{modelConfig.temperature ?? 1}</span>
                       </label>
                       <input 
@@ -653,7 +748,7 @@ export default function App() {
                         className="w-full accent-emerald-500"
                       />
                       <p className="text-[10px] text-zinc-400 mt-1">
-                        Lower values are more deterministic, higher values more creative.
+                        {t.tempDesc}
                       </p>
                     </div>
                   </div>
@@ -665,7 +760,7 @@ export default function App() {
                     className="w-full py-4 bg-zinc-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-zinc-800 transition-colors shadow-lg shadow-zinc-200"
                   >
                     <Save size={20} />
-                    SAVE CONFIGURATION
+                    {t.saveConfig}
                   </button>
                 </div>
               </div>
