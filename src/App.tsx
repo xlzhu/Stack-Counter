@@ -722,7 +722,7 @@ export default function App() {
         {/* Footer */}
         <footer className="mt-8 text-center">
           <p className="text-xs text-zinc-400 font-medium uppercase tracking-tighter">
-            {t.footer} • v1.0.3
+            {t.footer} • v1.0.5
           </p>
         </footer>
       </div>
