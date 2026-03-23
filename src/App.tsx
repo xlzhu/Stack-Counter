@@ -5,7 +5,7 @@
 
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Plus, Minus, RotateCcw, Layers, Camera, Upload, Loader2, X, Check, Settings, Globe, Cpu, Save, Languages, Zap, Image as ImageIcon } from 'lucide-react';
+import { Plus, Minus, RotateCcw, Layers, Camera, Upload, Loader2, X, Check, Settings, Globe, Cpu, Save, Languages, Zap, Image as ImageIcon, SwitchCamera } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 import { analyzeImageLocal } from './utils/cv';
 
@@ -74,7 +74,8 @@ const TRANSLATIONS = {
     peakDistance: 'Peak Distance',
     peakProminence: 'Peak Prominence',
     localAnalyzing: 'Analyzing Locally...',
-    exportFailed: 'Failed to export the ROI test image.'
+    exportFailed: 'Failed to export the ROI test image.',
+    resetParams: 'Reset'
   },
   zh: {
     title: '层级计数器',
@@ -118,7 +119,8 @@ const TRANSLATIONS = {
     peakDistance: '峰值间距',
     peakProminence: '峰值突起度',
     localAnalyzing: '本地分析中...',
-    exportFailed: '导出 ROI 测试图失败。'
+    exportFailed: '导出 ROI 测试图失败。',
+    resetParams: '恢复默认'
   }
 };
 
@@ -212,16 +214,25 @@ export default function App() {
   const [localParams, setLocalParams] = useState({
     roiStart: 0.12,
     roiEnd: 0.94,
-    distance: 4,
-    prominence: 6
+    distance: 8,
+    prominence: 10
   });
   const [draggingHandle, setDraggingHandle] = useState<'start' | 'end' | null>(null);
+  const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
+  const [currentCameraId, setCurrentCameraId] = useState<string | null>(null);
   
   const [modelConfig, setModelConfig] = useState<ModelConfig>(() => {
     const saved = localStorage.getItem('stack_counter_config');
     if (saved) {
       try {
-        return JSON.parse(saved);
+        const parsed = JSON.parse(saved);
+        return {
+          type: parsed.type || 'gemini',
+          endpoint: parsed.endpoint,
+          apiKey: parsed.apiKey,
+          modelName: parsed.modelName || 'gemini-3.1-pro-preview',
+          temperature: parsed.temperature ?? 1
+        };
       } catch (e) {
         console.error("Failed to parse saved config", e);
       }
@@ -242,6 +253,9 @@ export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const overlayImageRef = useRef<HTMLImageElement>(null);
+
+  const videoContainerRef = useRef<HTMLDivElement>(null);
+  const overlayBoxRef = useRef<HTMLDivElement>(null);
 
   const increment = useCallback(() => {
     const newId = Math.random().toString(36).substring(2, 9);
@@ -704,15 +718,31 @@ export default function App() {
         if (!videoRef.current) return;
 
         try {
-          stream = await navigator.mediaDevices.getUserMedia({ 
-            video: { 
-              facingMode: 'environment', 
-              width: { ideal: 1920 }, 
-              height: { ideal: 1080 } 
-            } 
-          });
+          const constraints: MediaStreamConstraints = {
+            video: currentCameraId 
+              ? { deviceId: { exact: currentCameraId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+              : { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
+          };
+
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
           if (videoRef.current) {
             videoRef.current.srcObject = stream;
+          }
+
+          // After getting stream (and permissions), enumerate devices to get labels
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const videoDevices = devices.filter(device => device.kind === 'videoinput');
+          setCameras(videoDevices);
+          
+          // If we didn't have a specific camera ID, set it to the currently active one
+          if (!currentCameraId && stream) {
+            const activeTrack = stream.getVideoTracks()[0];
+            const activeDevice = videoDevices.find(d => d.label === activeTrack.label);
+            if (activeDevice) {
+              setCurrentCameraId(activeDevice.deviceId);
+            } else if (videoDevices.length > 0) {
+              setCurrentCameraId(videoDevices[0].deviceId);
+            }
           }
         } catch (err) {
           console.error("Camera Error:", err);
@@ -729,20 +759,74 @@ export default function App() {
         stream.getTracks().forEach(track => track.stop());
       }
     };
-  }, [isCameraActive]);
+  }, [isCameraActive, currentCameraId, t.errorCamera]);
+
+  const switchCamera = () => {
+    if (cameras.length > 1) {
+      const currentIndex = cameras.findIndex(c => c.deviceId === currentCameraId);
+      const nextIndex = (currentIndex + 1) % cameras.length;
+      setCurrentCameraId(cameras[nextIndex].deviceId);
+    }
+  };
 
   const stopCamera = () => {
     setIsCameraActive(false);
   };
 
   const captureImage = async () => {
-    if (videoRef.current && canvasRef.current) {
-      const context = canvasRef.current.getContext('2d');
+    if (videoRef.current && canvasRef.current && overlayBoxRef.current && videoContainerRef.current) {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      const context = canvas.getContext('2d');
+      const overlayRect = overlayBoxRef.current.getBoundingClientRect();
+      const containerRect = videoContainerRef.current.getBoundingClientRect();
+
       if (context) {
-        canvasRef.current.width = videoRef.current.videoWidth;
-        canvasRef.current.height = videoRef.current.videoHeight;
-        context.drawImage(videoRef.current, 0, 0);
-        const base64Data = canvasRef.current.toDataURL('image/jpeg', 0.85);
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        const cw = containerRect.width;
+        const ch = containerRect.height;
+
+        // Calculate scaling applied by object-cover
+        const scaleCover = Math.max(cw / vw, ch / vh);
+        const displayW = vw * scaleCover;
+        const displayH = vh * scaleCover;
+
+        // Calculate dimensions after zoom
+        const zoomedDisplayW = displayW * zoom;
+        const zoomedDisplayH = displayH * zoom;
+        
+        // Calculate offset of the zoomed video relative to the container
+        const zoomedOffsetX = (cw - zoomedDisplayW) / 2;
+        const zoomedOffsetY = (ch - zoomedDisplayH) / 2;
+
+        // Calculate overlay box position relative to the container
+        const boxX = overlayRect.left - containerRect.left;
+        const boxY = overlayRect.top - containerRect.top;
+        const boxW = overlayRect.width;
+        const boxH = overlayRect.height;
+
+        // Map box coordinates to the zoomed video coordinates
+        const boxXInVideo = boxX - zoomedOffsetX;
+        const boxYInVideo = boxY - zoomedOffsetY;
+
+        // Scale back to the intrinsic video resolution
+        const scaleToIntrinsic = vw / zoomedDisplayW;
+        const sourceX = Math.max(0, boxXInVideo * scaleToIntrinsic);
+        const sourceY = Math.max(0, boxYInVideo * scaleToIntrinsic);
+        const sourceW = Math.min(vw - sourceX, boxW * scaleToIntrinsic);
+        const sourceH = Math.min(vh - sourceY, boxH * scaleToIntrinsic);
+
+        canvas.width = sourceW;
+        canvas.height = sourceH;
+
+        context.drawImage(
+          video,
+          sourceX, sourceY, sourceW, sourceH,
+          0, 0, sourceW, sourceH
+        );
+
+        const base64Data = canvas.toDataURL('image/jpeg', 0.85);
         stopCamera();
         const compressedDataUrl = await compressImage(base64Data);
         analyzeImage(compressedDataUrl);
@@ -1101,7 +1185,7 @@ export default function App() {
         {/* Footer */}
         <footer className="mt-8 text-center">
           <p className="text-xs text-zinc-400 font-medium uppercase tracking-tighter">
-            {t.footer} • v1.0.6
+            {t.footer} • v1.0.9
           </p>
         </footer>
       </div>
@@ -1115,14 +1199,21 @@ export default function App() {
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 bg-black flex flex-col"
           >
-            <div className="p-4 flex justify-between items-center text-white">
+            <div className="p-4 flex justify-between items-center text-white relative z-10">
               <h2 className="font-bold">{t.scanStack}</h2>
-              <button onClick={stopCamera} className="p-2 bg-white/10 rounded-full">
-                <X size={24} />
-              </button>
+              <div className="flex gap-4">
+                {cameras.length > 1 && (
+                  <button onClick={switchCamera} className="p-2 bg-white/10 rounded-full hover:bg-white/20 transition-colors">
+                    <SwitchCamera size={24} />
+                  </button>
+                )}
+                <button onClick={stopCamera} className="p-2 bg-white/10 rounded-full hover:bg-white/20 transition-colors">
+                  <X size={24} />
+                </button>
+              </div>
             </div>
             
-            <div className="flex-1 relative overflow-hidden flex items-center justify-center bg-black">
+            <div ref={videoContainerRef} className="flex-1 relative overflow-hidden flex items-center justify-center bg-black">
               <video 
                 ref={videoRef} 
                 autoPlay 
@@ -1133,7 +1224,7 @@ export default function App() {
               />
               {/* Scan Overlay */}
               <div className="absolute inset-0 border-[40px] border-black/40 pointer-events-none flex items-center justify-center">
-                <div className="w-full max-w-[280px] aspect-[3/4] border-2 border-emerald-400/50 rounded-2xl relative">
+                <div ref={overlayBoxRef} className="w-full max-w-[280px] aspect-[3/4] border-2 border-emerald-400/50 rounded-2xl relative">
                   <div className="absolute top-0 left-0 w-8 h-8 border-t-4 border-l-4 border-emerald-400 rounded-tl-lg" />
                   <div className="absolute top-0 right-0 w-8 h-8 border-t-4 border-r-4 border-emerald-400 rounded-tr-lg" />
                   <div className="absolute bottom-0 left-0 w-8 h-8 border-b-4 border-l-4 border-emerald-400 rounded-bl-lg" />
@@ -1207,10 +1298,19 @@ export default function App() {
                 <div className="p-6 space-y-6 overflow-y-auto custom-scrollbar">
                   {/* Local CV Settings */}
                   <div className="space-y-4 border-b border-zinc-100 pb-6">
-                    <h3 className="text-sm font-bold text-zinc-800 flex items-center gap-2">
-                      <Zap size={16} className="text-emerald-500" />
-                      {t.fastMode} Settings
-                    </h3>
+                    <div className="flex justify-between items-center">
+                      <h3 className="text-sm font-bold text-zinc-800 flex items-center gap-2">
+                        <Zap size={16} className="text-emerald-500" />
+                        {t.fastMode} Settings
+                      </h3>
+                      <button 
+                        onClick={() => setLocalParams({ roiStart: 0.12, roiEnd: 0.94, distance: 8, prominence: 10 })}
+                        className="text-[10px] font-bold text-zinc-400 hover:text-emerald-600 uppercase tracking-widest flex items-center gap-1 transition-colors"
+                      >
+                        <RotateCcw size={12} />
+                        {t.resetParams}
+                      </button>
+                    </div>
                     
                     <div className="flex gap-4">
                       <div className="flex-1">

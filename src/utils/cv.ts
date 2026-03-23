@@ -249,9 +249,10 @@ function detectDensePeaks(signal: number[], regionHeight: number, distance: numb
 }
 
 function detectPeaks(signal: number[], regionHeight: number, distance: number, prominence: number) {
-  const adaptiveDistance = Math.max(distance, Math.round(regionHeight / 220));
-  const adaptiveProminence = Math.max(prominence, regionHeight < 500 ? 5 : regionHeight < 900 ? 6 : 8);
-  const mergeRatio = regionHeight < 500 ? 0.32 : regionHeight < 900 ? 0.38 : 0.44;
+  // Increase adaptive distance and prominence to prevent overcounting from texture (e.g., corrugated cardboard)
+  const adaptiveDistance = Math.max(distance, Math.round(regionHeight / 150));
+  const adaptiveProminence = Math.max(prominence, regionHeight < 500 ? 8 : regionHeight < 900 ? 10 : 12);
+  const mergeRatio = regionHeight < 500 ? 0.4 : regionHeight < 900 ? 0.45 : 0.5;
 
   let peaks = findPeaks(signal, adaptiveDistance, adaptiveProminence);
   const topClip = Math.floor(signal.length * 0.02);
@@ -272,7 +273,9 @@ function getAdaptiveXRange(width: number) {
 }
 
 function isBoundaryRed(r: number, g: number, b: number) {
-  return r >= 185 && g <= 140 && b <= 140 && r - Math.max(g, b) >= 65;
+  // Refined red detection: Red must be significantly higher than Green and Blue
+  const maxGB = Math.max(g, b);
+  return r > 120 && r > maxGB * 1.4 && (r - maxGB) > 40;
 }
 
 function detectRedBoundaryLines(imageData: ImageData) {
@@ -302,8 +305,11 @@ function detectRedBoundaryLines(imageData: ImageData) {
     longestRuns[y] = longestRun;
   }
 
-  const minCoverage = Math.max(24, Math.floor(width * 0.55));
-  const minRun = Math.max(24, Math.floor(width * 0.5));
+  // A red line might not span the entire width, but should be prominent.
+  // Require at least 10% coverage or a continuous run of 5% of the width.
+  const minCoverage = Math.max(10, Math.floor(width * 0.10));
+  const minRun = Math.max(10, Math.floor(width * 0.05));
+  
   const candidateRows: number[] = [];
   for (let y = 0; y < height; y++) {
     if (rowHits[y] >= minCoverage && longestRuns[y] >= minRun) {
@@ -313,57 +319,52 @@ function detectRedBoundaryLines(imageData: ImageData) {
 
   if (candidateRows.length < 2) return null;
 
-  const groups: Array<{ start: number; end: number; center: number; score: number }> = [];
+  const groups: Array<{ start: number; end: number; center: number; maxHits: number }> = [];
   let groupStart = candidateRows[0];
   let groupEnd = candidateRows[0];
+  let maxHitsInGroup = rowHits[candidateRows[0]];
 
   for (let i = 1; i < candidateRows.length; i++) {
     const row = candidateRows[i];
-    if (row <= groupEnd + 2) {
+    if (row <= groupEnd + 10) { // Allow gaps up to 10 pixels for thick/anti-aliased lines
       groupEnd = row;
+      maxHitsInGroup = Math.max(maxHitsInGroup, rowHits[row]);
       continue;
     }
 
-    const thickness = groupEnd - groupStart + 1;
-    const coverage = rowHits.slice(groupStart, groupEnd + 1);
-    const runs = longestRuns.slice(groupStart, groupEnd + 1);
-    const avgCoverage = mean(coverage) / width;
-    const avgRun = mean(runs) / width;
-    const score = avgCoverage * 0.6 + avgRun * 0.3 + Math.min(0.1, thickness / 20);
     groups.push({
       start: groupStart,
       end: groupEnd,
       center: Math.round((groupStart + groupEnd) / 2),
-      score
+      maxHits: maxHitsInGroup
     });
+    
     groupStart = row;
     groupEnd = row;
+    maxHitsInGroup = rowHits[row];
   }
-  {
-    const thickness = groupEnd - groupStart + 1;
-    const coverage = rowHits.slice(groupStart, groupEnd + 1);
-    const runs = longestRuns.slice(groupStart, groupEnd + 1);
-    const avgCoverage = mean(coverage) / width;
-    const avgRun = mean(runs) / width;
-    const score = avgCoverage * 0.6 + avgRun * 0.3 + Math.min(0.1, thickness / 20);
-    groups.push({
-      start: groupStart,
-      end: groupEnd,
-      center: Math.round((groupStart + groupEnd) / 2),
-      score
-    });
-  }
+  groups.push({
+    start: groupStart,
+    end: groupEnd,
+    center: Math.round((groupStart + groupEnd) / 2),
+    maxHits: maxHitsInGroup
+  });
 
+  // Filter groups by requiring a solid horizontal presence
   const validGroups = groups
-    .filter((group) => group.end - group.start + 1 >= 2)
-    .filter((group) => group.score >= 0.78)
-    .sort((a, b) => a.center - b.center);
+    .filter((group) => group.maxHits >= width * 0.15) // At least 15% coverage for a valid line
+    .sort((a, b) => b.maxHits - a.maxHits); // Sort by strongest lines (most red pixels)
 
   if (validGroups.length < 2) return null;
 
-  const top = validGroups[0].center;
-  const bottom = validGroups[validGroups.length - 1].center;
-  if (bottom - top < Math.max(80, height * 0.1)) return null;
+  // Take the two strongest lines and order them top to bottom
+  const topTwo = [validGroups[0], validGroups[1]].sort((a, b) => a.center - b.center);
+
+  const top = topTwo[0].center;
+  const bottom = topTwo[1].center;
+  
+  // Sanity check: they should be reasonably far apart
+  if (bottom - top < Math.max(20, height * 0.05)) return null;
 
   return { y1: top, y2: bottom };
 }
@@ -411,7 +412,7 @@ export function analyzeImageLocal(
     edgeProjection[y - y1] = edgeSum / roiWidth;
   }
 
-  const smoothRadius = Math.max(1, Math.round(roiHeight / 260));
+  const smoothRadius = Math.max(2, Math.round(roiHeight / 150));
   const brightnessSignal = normalizeSignal(smoothSignal(brightnessProjection, smoothRadius));
   const edgeSignal = normalizeSignal(smoothSignal(edgeProjection, smoothRadius));
 
