@@ -24,9 +24,20 @@ interface ModelConfig {
 
 interface LocalResult {
   peaks: number[];
+  intersectionPoints: { x: number; y: number }[];
   y1: number;
   y2: number;
+  boundaryY1?: number;
+  boundaryY2?: number;
   height: number;
+  width: number;
+  centerX: number;
+  deskewAngle?: number;
+  qualityScore?: number;
+  boundarySource?: 'red_lines' | 'texture' | 'ratio';
+  quarterTurnAngle?: number;
+  selectedBandRatio?: number;
+  candidateBands?: Array<{ ratio: number; centerX: number; count: number; qualityScore: number }>;
 }
 
 type Language = 'en' | 'zh';
@@ -136,10 +147,17 @@ const COLORS = [
 ];
 
 const ROI_HANDLE_GAP = 0.05;
+const LOCAL_ANALYSIS_MAX_DIMENSION = 1920; // Increased from 1024px to 1920px for Phase 1.1
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
-const compressImage = (dataUrl: string, maxWidth = 1024, maxHeight = 1024, initialQuality = 0.7): Promise<string> => {
+const compressImage = (
+  dataUrl: string,
+  maxWidth = 1024,
+  maxHeight = 1024,
+  initialQuality = 0.7,
+  mimeType: 'image/jpeg' | 'image/png' = 'image/jpeg'
+): Promise<string> => {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
@@ -164,15 +182,21 @@ const compressImage = (dataUrl: string, maxWidth = 1024, maxHeight = 1024, initi
       const ctx = canvas.getContext('2d');
       if (ctx) {
         ctx.drawImage(img, 0, 0, width, height);
+
+        if (mimeType === 'image/png') {
+          resolve(canvas.toDataURL('image/png'));
+          return;
+        }
+
         let quality = initialQuality;
         let compressed = canvas.toDataURL('image/jpeg', quality);
-        
+
         // Ensure the base64 string is under ~1.5MB (approx 1MB actual size)
         while (compressed.length > 1500000 && quality > 0.1) {
           quality -= 0.1;
           compressed = canvas.toDataURL('image/jpeg', quality);
         }
-        
+
         resolve(compressed);
       } else {
         resolve(dataUrl);
@@ -210,6 +234,7 @@ export default function App() {
   const [analysisMode, setAnalysisMode] = useState<'ai' | 'local'>('ai');
   const [viewMode, setViewMode] = useState<'stack' | 'image'>('stack');
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
+  const [correctedImageUrl, setCorrectedImageUrl] = useState<string | null>(null);
   const [localResult, setLocalResult] = useState<LocalResult | null>(null);
   const [localParams, setLocalParams] = useState({
     roiStart: 0.12,
@@ -271,6 +296,7 @@ export default function App() {
     setStack([]);
     setError(null);
     setUploadedImage(null);
+    setCorrectedImageUrl(null);
     setLocalResult(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -330,8 +356,8 @@ export default function App() {
         ctx.stroke();
       };
 
-      drawBoundary(localResult.y1);
-      drawBoundary(localResult.y2);
+      drawBoundary(localResult.boundaryY1 ?? localResult.y1);
+      drawBoundary(localResult.boundaryY2 ?? localResult.y2);
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const link = document.createElement('a');
@@ -368,11 +394,34 @@ export default function App() {
       localParams.prominence
     );
 
+    // Convert corrected ImageData (deskewed + center line) to a displayable data URL
+    if (result.correctedImageData) {
+      const corrCanvas = document.createElement('canvas');
+      corrCanvas.width = result.correctedImageData.width;
+      corrCanvas.height = result.correctedImageData.height;
+      const corrCtx = corrCanvas.getContext('2d');
+      if (corrCtx) {
+        corrCtx.putImageData(result.correctedImageData, 0, 0);
+        setCorrectedImageUrl(corrCanvas.toDataURL('image/jpeg', 0.92));
+      }
+    }
+
     setLocalResult({
       peaks: result.peaks,
+      intersectionPoints: result.intersectionPoints,
       y1: result.y1,
       y2: result.y2,
-      height: result.height
+      boundaryY1: result.boundaryY1,
+      boundaryY2: result.boundaryY2,
+      height: result.height,
+      width: result.width,
+      centerX: result.centerX,
+      deskewAngle: result.deskewAngle,
+      qualityScore: result.qualityScore,
+      boundarySource: result.boundarySource,
+      quarterTurnAngle: result.quarterTurnAngle,
+      selectedBandRatio: result.selectedBandRatio,
+      candidateBands: result.candidateBands
     });
     updateStackCount(result.count);
     setViewMode('image');
@@ -393,6 +442,26 @@ export default function App() {
 
     return () => window.clearTimeout(timer);
   }, [analysisMode, uploadedImage, localParams, runLocalAnalysis, t.analysisFailed]);
+
+  useEffect(() => {
+    (window as Window & {
+      __STACK_COUNTER_TEST_STATE?: {
+        count: number;
+        analysisMode: 'ai' | 'local';
+        uploadedImage: boolean;
+        localResult: LocalResult | null;
+        error: string | null;
+        isProcessing: boolean;
+      };
+    }).__STACK_COUNTER_TEST_STATE = {
+      count: stack.length,
+      analysisMode,
+      uploadedImage: Boolean(uploadedImage),
+      localResult,
+      error,
+      isProcessing
+    };
+  }, [analysisMode, error, isProcessing, localResult, stack.length, uploadedImage]);
 
   const updateRoiHandle = useCallback((clientY: number, handle: 'start' | 'end') => {
     const image = overlayImageRef.current;
@@ -442,49 +511,171 @@ export default function App() {
     };
   }, [draggingHandle, updateRoiHandle]);
 
-  const analyzeImage = async (base64Data: string) => {
+  const analyzeImage = async (
+    localImageData: string,
+    aiImageData: string = localImageData,
+    refinedLocalImageData?: string
+  ) => {
     setIsProcessing(true);
     setError(null);
-    setUploadedImage(base64Data);
+    setUploadedImage(localImageData);
     
     try {
-      // Always run local analysis first to check for red boundary lines
-      const img = new Image();
-      await new Promise((resolve, reject) => {
-        img.onload = resolve;
-        img.onerror = reject;
-        img.src = base64Data;
-      });
+      const analyzeLocalData = async (dataUrl: string) => {
+        const img = new Image();
+        await new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = reject;
+          img.src = dataUrl;
+        });
 
-      const canvas = document.createElement('canvas');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error("Could not get canvas context");
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error("Could not get canvas context");
 
-      ctx.drawImage(img, 0, 0);
-      const imageData = ctx.getImageData(0, 0, img.width, img.height);
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, img.width, img.height);
 
-      const localRes = analyzeImageLocal(
-        imageData,
-        [localParams.roiStart, localParams.roiEnd],
-        localParams.distance,
-        localParams.prominence
-      );
+        return analyzeImageLocal(
+          imageData,
+          [localParams.roiStart, localParams.roiEnd],
+          localParams.distance,
+          localParams.prominence
+        );
+      };
+
+      const commitLocalResult = (result: ReturnType<typeof analyzeImageLocal>, sourceImageData: string) => {
+        setUploadedImage(sourceImageData);
+
+        if (result.correctedImageData) {
+          const corrCanvas = document.createElement('canvas');
+          corrCanvas.width = result.correctedImageData.width;
+          corrCanvas.height = result.correctedImageData.height;
+          const corrCtx = corrCanvas.getContext('2d');
+          if (corrCtx) {
+            corrCtx.putImageData(result.correctedImageData, 0, 0);
+            setCorrectedImageUrl(corrCanvas.toDataURL('image/jpeg', 0.92));
+          }
+        }
+
+        setLocalResult({
+          peaks: result.peaks,
+          intersectionPoints: result.intersectionPoints,
+          y1: result.y1,
+          y2: result.y2,
+          boundaryY1: result.boundaryY1,
+          boundaryY2: result.boundaryY2,
+          height: result.height,
+          width: result.width,
+          centerX: result.centerX,
+          deskewAngle: result.deskewAngle,
+          qualityScore: result.qualityScore,
+          boundarySource: result.boundarySource,
+          quarterTurnAngle: result.quarterTurnAngle,
+          selectedBandRatio: result.selectedBandRatio,
+          candidateBands: result.candidateBands
+        });
+        updateStackCount(result.count);
+        setViewMode('image');
+      };
+
+      let localRes = await analyzeLocalData(localImageData);
+      let finalLocalImageData = localImageData;
+
+      // Phase 1.1: Increased resolution from 1024px to 1920px
+      // High-layer images (≥40 layers) need higher resolution to preserve fine texture details
+      // and avoid undercount errors. Spacing increases from 4-8px to 6-12px at 1920px.
+      const roiHeight = localRes.y2 - localRes.y1;
+      const roiCoverage = localRes.height > 0 ? roiHeight / localRes.height : 0;
+      const localPeakSpacings = localRes.peaks.slice(1).map((value, index) => value - localRes.peaks[index]);
+      const sortedLocalSpacings = [...localPeakSpacings].sort((a, b) => a - b);
+      const medianLocalSpacing = sortedLocalSpacings.length > 0
+        ? sortedLocalSpacings[Math.floor(sortedLocalSpacings.length / 2)]
+        : 0;
+      const localQuality = localRes.qualityScore ?? 0;
+      const shouldRefineDense =
+        localRes.boundarySource !== 'red_lines' &&
+        localRes.count >= 45 &&
+        localQuality >= 0.78 &&
+        medianLocalSpacing > 0 &&
+        medianLocalSpacing <= 9;
+      const shouldRefineWideTexture = localRes.boundarySource === 'texture' && roiCoverage >= 0.72;
+      const shouldRefineDeskewFallback =
+        localRes.boundarySource === 'ratio' && Math.abs(localRes.deskewAngle ?? 0) >= 8;
+
+      if (
+        refinedLocalImageData &&
+        (shouldRefineDense || shouldRefineWideTexture || shouldRefineDeskewFallback)
+      ) {
+        const refinedRes = await analyzeLocalData(refinedLocalImageData);
+        const refinedImprovesWideTexture =
+          shouldRefineWideTexture && refinedRes.count <= localRes.count - 4;
+        const refinedImprovesDeskewFallback =
+          shouldRefineDeskewFallback && refinedRes.boundarySource !== 'ratio';
+        const refinedQuality = refinedRes.qualityScore ?? 0;
+        const countDelta = refinedRes.count - localRes.count;
+        const refinedImprovesDenseLocalGapCase =
+          analysisMode === 'local' &&
+          shouldRefineDense &&
+          (localRes.selectedBandRatio ?? 0.5) !== 0.5 &&
+          localRes.count >= 60 &&
+          localQuality <= 0.62 &&
+          countDelta >= 8 &&
+          refinedQuality >= localQuality - 0.12;
+        const refinedAllowsDenseDecrease =
+          countDelta < 0 &&
+          (
+            (
+              analysisMode !== 'local' &&
+              refinedQuality >= localQuality - 0.08
+            ) ||
+            (
+              analysisMode === 'local' &&
+              Math.abs(countDelta) <= 6 &&
+              refinedQuality >= localQuality - 0.03
+            ) ||
+            (
+              analysisMode === 'local' &&
+              refinedQuality >= localQuality + 0.05
+            )
+          );
+        const refinedImprovesDense =
+          shouldRefineDense &&
+          (
+            refinedImprovesDenseLocalGapCase ||
+            (
+              Math.abs(countDelta) >= 4 &&
+              (
+                (
+                  refinedAllowsDenseDecrease
+                ) ||
+                (
+                  countDelta > 0 &&
+                  (
+                    (countDelta <= 8 && refinedQuality >= localQuality - 0.01) ||
+                    refinedQuality >= localQuality + 0.02
+                  )
+                )
+              )
+            )
+          );
+
+        if (refinedImprovesWideTexture || refinedImprovesDeskewFallback || refinedImprovesDense) {
+          localRes = refinedRes;
+          finalLocalImageData = refinedLocalImageData;
+        }
+      }
 
       // If red lines are detected, OR if we are already in local mode, use the local result
       if (localRes.boundarySource === 'red_lines' || analysisMode === 'local') {
         if (localRes.boundarySource === 'red_lines' && analysisMode !== 'local') {
           setAnalysisMode('local'); // Auto-switch to local mode
         }
-        setLocalResult({
-          peaks: localRes.peaks,
-          y1: localRes.y1,
-          y2: localRes.y2,
-          height: localRes.height
-        });
-        updateStackCount(localRes.count);
-        setViewMode('image');
+
+        commitLocalResult(localRes, finalLocalImageData);
+        setIsProcessing(false);
         return;
       }
 
@@ -509,7 +700,7 @@ export default function App() {
                 {
                   inlineData: {
                     mimeType: "image/jpeg",
-                    data: base64Data.split(',')[1]
+                    data: aiImageData.split(',')[1]
                   }
                 }
               ]
@@ -531,20 +722,27 @@ export default function App() {
         if (!modelConfig.endpoint) throw new Error("Custom endpoint URL is required");
         
         let finalEndpoint = modelConfig.endpoint.trim();
-        const isNvidia = finalEndpoint.includes('nvidia.com') || finalEndpoint.includes('localhost') || finalEndpoint.includes('127.0.0.1');
+        const isOpenRouter = finalEndpoint.includes('openrouter.ai');
+        const isNvidia = finalEndpoint.includes('nvidia.com') || finalEndpoint.includes('localhost') || finalEndpoint.includes('127.0.0.1') || modelConfig.modelName?.toLowerCase().includes('nvidia') || modelConfig.modelName?.toLowerCase().includes('nemotron');
         const isNvidiaCv = isNvidia && (finalEndpoint.includes('/cv/') || modelConfig.modelName?.toLowerCase().includes('ocr') || modelConfig.modelName?.toLowerCase().includes('cv'));
 
         try {
           const urlObj = new URL(finalEndpoint);
-          if (isNvidiaCv) {
+          if (isOpenRouter) {
+            // For OpenRouter, ensure it uses /api/v1/chat/completions
+            if (urlObj.pathname === '/' || urlObj.pathname === '/api/v1' || urlObj.pathname === '/api/v1/') {
+              const basePath = finalEndpoint.replace(/\/$/, '');
+              finalEndpoint = urlObj.pathname === '/' ? `${basePath}/api/v1/chat/completions` : `${basePath}/chat/completions`;
+            }
+          } else if (isNvidiaCv) {
             // For NVIDIA CV models, if it's a base URL, append /v1/infer
             if (urlObj.pathname === '/' || urlObj.pathname === '/v1' || urlObj.pathname === '/v1/') {
               finalEndpoint = finalEndpoint.replace(/\/$/, '') + '/v1/infer';
             }
           } else {
-            // Only append /chat/completions if it looks like a base URL (e.g., ends with /v1 or has no specific path)
-            if (!finalEndpoint.endsWith('/chat/completions') && 
-                (urlObj.pathname === '/v1' || urlObj.pathname === '/v1/' || urlObj.pathname === '/')) {
+            // Only append /chat/completions if it looks like a base URL (e.g., ends with /v1, /api/v1 or has no specific path)
+            if (!finalEndpoint.endsWith('/chat/completions') &&
+                (urlObj.pathname === '/v1' || urlObj.pathname === '/v1/' || urlObj.pathname === '/api/v1' || urlObj.pathname === '/api/v1/' || urlObj.pathname === '/')) {
               finalEndpoint = finalEndpoint.replace(/\/$/, '') + '/chat/completions';
             }
           }
@@ -560,8 +758,9 @@ export default function App() {
         
         let payload: any;
         const modelName = modelConfig.modelName || (isNvidia ? (finalEndpoint.split('/').pop() || 'nvidia/nemotron-ocr-v1') : 'gpt-4o');
+        // Nemotron-3 Super does not support image input (text-only)
         const isMultimodal = !modelName.includes('nemotron-3-super') && !modelName.includes('qwen3.5-122b');
-        
+
         if (isNvidiaCv) {
           // NVIDIA CV-specific API format (e.g., nemotron-ocr-v1)
           // Requires an "input" wrapper as a list
@@ -569,7 +768,7 @@ export default function App() {
             input: [
               {
                 type: 'image_url',
-                url: base64Data
+                url: aiImageData
               }
             ],
             merge_levels: ['paragraph']
@@ -582,26 +781,28 @@ export default function App() {
               {
                 role: 'user',
                 content: isMultimodal ? [
-                  { type: 'text', text: isNvidia ? `${systemInstruction}\n\n${promptText}` : promptText },
+                  { type: 'text', text: (isNvidia && !isOpenRouter) ? `${systemInstruction}\n\n${promptText}` : promptText },
                   {
                     type: 'image_url',
-                    image_url: { url: base64Data }
+                    image_url: { url: aiImageData }
                   }
-                ] : (isNvidia ? `${systemInstruction}\n\n${promptText}` : promptText)
+                ] : ((isNvidia && !isOpenRouter) ? `${systemInstruction}\n\n${promptText}` : promptText)
               }
             ],
             temperature: modelConfig.temperature ?? 1,
             max_tokens: 1024
           };
 
-          if (!isNvidia && isMultimodal) {
+          if (!isNvidia || isOpenRouter) {
             payload.messages.unshift({ role: 'system', content: systemInstruction });
           }
 
           // Special handling for Nemotron-3 Super with thinking capabilities
           if (modelName.includes('nemotron-3-super')) {
-            payload.chat_template_kwargs = { enable_thinking: true };
-            payload.reasoning_budget = 16384;
+            if (!isOpenRouter) {
+              payload.chat_template_kwargs = { enable_thinking: true };
+              payload.reasoning_budget = 16384;
+            }
             payload.max_tokens = 16384;
             payload.top_p = 0.95;
           }
@@ -630,33 +831,49 @@ export default function App() {
           body: JSON.stringify({
             endpoint: finalEndpoint,
             apiKey: apiKey,
+            extraHeaders: isOpenRouter ? {
+              'HTTP-Referer': 'https://github.com/google/gemini-cli',
+              'X-Title': 'Stack-Counter'
+            } : undefined,
             body: payload
           })
         });
 
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          const errorObj = errorData.error || errorData;
-          let errorMessage = errorObj.message || errorObj.detail || errorObj.type || (typeof errorData === 'string' ? errorData : null);
-          
+        let data: any;
+        try {
+          data = await response.json();
+        } catch {
+          throw new Error(`Invalid JSON response from API (status ${response.status})`);
+        }
+
+        console.error('LLM error response:', JSON.stringify(data, null, 2));
+
+        if (!response.ok || data?.error) {
+          const errorObj = data?.error || data || {};
+          let errorMessage = errorObj.message || errorObj.detail || errorObj.type || (typeof data === 'string' ? data : null);
+
           if (response.status === 422) {
             errorMessage = `API Error 422: Invalid request format. For NVIDIA CV models, ensure the URL is correct. Details: ${JSON.stringify(errorObj)}`;
           } else if (errorObj.type === 'access_terminated_error') {
             errorMessage = "API Access Terminated: Your API key or account has been disabled by the provider. Please check your account status.";
           } else if (errorObj.type === 'insufficient_quota' || errorObj.code === 'insufficient_quota') {
             errorMessage = "Insufficient Quota: Your API account has run out of credits or reached its limit.";
+          } else if (errorMessage && typeof errorMessage === 'string' && errorMessage.includes('No endpoints found')) {
+            errorMessage = `OpenRouter Error: "No endpoints found". This usually happens for free models if your OpenRouter settings have "Request No Training" enabled. Please go to OpenRouter Settings > Training, Logging, & Privacy and enable "Enable free endpoints that may train on inputs".`;
+          } else if (errorMessage === 'Provider returned error' && errorObj.metadata?.raw) {
+            errorMessage = `Provider returned error: ${JSON.stringify(errorObj.metadata.raw)}`;
           }
-          
+
           throw new Error(errorMessage || `API Error: ${response.status}`);
         }
 
-        const data = await response.json();
-        
+        console.log('LLM response data:', JSON.stringify(data, null, 2));
+
         let resultText = "";
         if (isNvidiaCv) {
           // NVIDIA CV API usually returns { "content": "..." } or { "text": "..." }
           // Or a nested structure: { "data": [ { "text_detections": [ { "text_prediction": { "text": "..." } } ] } ] }
-          if (data.data && Array.isArray(data.data)) {
+          if (data?.data && Array.isArray(data.data)) {
             let combinedText = "";
             for (const detection of data.data) {
               if (detection.text_detections && Array.isArray(detection.text_detections)) {
@@ -669,13 +886,17 @@ export default function App() {
             }
             resultText = combinedText.trim();
           } else {
-            resultText = data.content || data.text || data.description || "";
+            resultText = data?.content || data?.text || data?.description || "";
           }
         } else {
           // Standard Chat API
-          const message = data.choices?.[0]?.message;
+          if (!data || !Array.isArray(data.choices)) {
+            console.error('Unexpected LLM response structure:', data);
+            throw new Error('Unexpected response from LLM API: missing choices array');
+          }
+          const message = data.choices[0]?.message;
           resultText = message?.content || "";
-          
+
           // If there is reasoning content, log it for debugging
           if (message?.reasoning_content) {
             console.log("Nemotron Reasoning:", message.reasoning_content);
@@ -829,7 +1050,14 @@ export default function App() {
         const base64Data = canvas.toDataURL('image/jpeg', 0.85);
         stopCamera();
         const compressedDataUrl = await compressImage(base64Data);
-        analyzeImage(compressedDataUrl);
+        const localAnalysisDataUrl = await compressImage(
+          base64Data,
+          LOCAL_ANALYSIS_MAX_DIMENSION,
+          LOCAL_ANALYSIS_MAX_DIMENSION,
+          0.7,
+          'image/png'
+        );
+        analyzeImage(localAnalysisDataUrl, compressedDataUrl, base64Data);
       }
     }
   };
@@ -870,7 +1098,14 @@ export default function App() {
         reader.onloadend = async () => {
           try {
             const compressedDataUrl = await compressImage(reader.result as string);
-            await analyzeImage(compressedDataUrl);
+            const localAnalysisDataUrl = await compressImage(
+              reader.result as string,
+              LOCAL_ANALYSIS_MAX_DIMENSION,
+              LOCAL_ANALYSIS_MAX_DIMENSION,
+              0.7,
+              'image/png'
+            );
+            await analyzeImage(localAnalysisDataUrl, compressedDataUrl, reader.result as string);
           } catch (err: any) {
             console.error("Image compression/analysis error:", err);
             setError(`${t.analysisFailed} (${err?.message || 'Unknown error'})`);
@@ -906,19 +1141,21 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 font-sans selection:bg-emerald-100">
-      <div className="max-w-md mx-auto h-screen flex flex-col p-6">
+      <div className="max-w-md sm:max-w-lg md:max-w-xl mx-auto h-screen flex flex-col p-6">
         
         {/* Header */}
         <header className="flex items-center justify-between mb-8">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 min-w-0">
             <div className="p-2 bg-zinc-900 rounded-lg text-white">
               <Layers size={20} />
             </div>
-            <h1 className="text-xl font-bold tracking-tight">{t.title}</h1>
+            <h1 className="text-xl font-bold tracking-tight whitespace-nowrap">{t.title}</h1>
           </div>
           <div className="flex gap-2">
             <button 
               onClick={() => setAnalysisMode(prev => prev === 'ai' ? 'local' : 'ai')}
+              data-testid="mode-toggle"
+              data-mode={analysisMode}
               className={`p-2 rounded-lg transition-colors flex items-center gap-1 ${analysisMode === 'local' ? 'bg-emerald-100 text-emerald-600' : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200'}`}
               title={analysisMode === 'local' ? t.fastMode : t.aiMode}
             >
@@ -960,6 +1197,7 @@ export default function App() {
             ref={fileInputRef} 
             onChange={handleFileUpload} 
             accept="image/*,.heic,.heif" 
+            data-testid="file-input"
             className="hidden" 
           />
         </header>
@@ -1041,34 +1279,76 @@ export default function App() {
             </div>
           ) : (
             <div className="flex-1 relative bg-zinc-900 overflow-hidden flex items-center justify-center">
-              {uploadedImage && (
+              {(correctedImageUrl || uploadedImage) && (
                 <div className="relative w-full h-full flex items-center justify-center p-4">
                   <div className="relative inline-block max-w-full max-h-full">
                     <img
                       ref={overlayImageRef}
-                      src={uploadedImage}
+                      src={correctedImageUrl || uploadedImage || ''}
                       alt="Analyzed"
                       className="max-w-full max-h-[calc(100vh-12rem)] object-contain select-none"
                       draggable={false}
-                      style={{ opacity: localResult ? 0.72 : 1 }}
+                      style={{ opacity: localResult ? 0.82 : 1 }}
                     />
                     {localResult && (
                       <svg
                         width="100%"
                         height="100%"
-                        viewBox="0 0 100 100"
+                        viewBox={`0 0 ${localResult.width} ${localResult.height}`}
                         preserveAspectRatio="none"
                         className="absolute inset-0 touch-none"
                       >
-                        <rect x="0" y={`${(localResult.y1 / localResult.height) * 100}`} width="100" height={`${((localResult.y2 - localResult.y1) / localResult.height) * 100}`} fill="rgba(239, 68, 68, 0.08)" />
+                        <defs>
+                          <filter id="dot-glow">
+                            <feGaussianBlur stdDeviation="3" result="blur"/>
+                            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+                          </filter>
+                        </defs>
 
-                        <line x1="0" y1={`${(localResult.y1 / localResult.height) * 100}`} x2="100" y2={`${(localResult.y1 / localResult.height) * 100}`} stroke="rgba(239, 68, 68, 0.9)" strokeWidth="0.6" strokeDasharray="2,2" />
-                        <line x1="0" y1={`${(localResult.y2 / localResult.height) * 100}`} x2="100" y2={`${(localResult.y2 / localResult.height) * 100}`} stroke="rgba(239, 68, 68, 0.9)" strokeWidth="0.6" strokeDasharray="2,2" />
+                        {/* ROI region tint */}
+                        <rect
+                          x="0" y={localResult.boundaryY1 ?? localResult.y1}
+                          width={localResult.width} height={(localResult.boundaryY2 ?? localResult.y2) - (localResult.boundaryY1 ?? localResult.y1)}
+                          fill="rgba(239,68,68,0.06)"
+                        />
 
-                        {localResult.peaks.map((p, i) => (
-                          <line key={i} x1="20" y1={`${(p / localResult.height) * 100}`} x2="80" y2={`${(p / localResult.height) * 100}`} stroke="rgba(16, 185, 129, 0.85)" strokeWidth="0.3" />
+                        {/* ROI top boundary */}
+                        <line
+                          x1="0" y1={localResult.boundaryY1 ?? localResult.y1} x2={localResult.width} y2={localResult.boundaryY1 ?? localResult.y1}
+                          stroke="rgba(239,68,68,0.85)" strokeWidth="1.5" strokeDasharray="6,4"
+                        />
+                        {/* ROI bottom boundary */}
+                        <line
+                          x1="0" y1={localResult.boundaryY2 ?? localResult.y2} x2={localResult.width} y2={localResult.boundaryY2 ?? localResult.y2}
+                          stroke="rgba(239,68,68,0.85)" strokeWidth="1.5" strokeDasharray="6,4"
+                        />
+
+                        {/* Vertical centre line (SVG mirror of the drawn red line in the image) */}
+                        <line
+                          x1={localResult.centerX} y1={localResult.boundaryY1 ?? localResult.y1}
+                          x2={localResult.centerX} y2={localResult.boundaryY2 ?? localResult.y2}
+                          stroke="rgba(255,60,60,0.55)" strokeWidth="2"
+                        />
+
+                        {/* Intersection dots — one per counted layer */}
+                        {localResult.intersectionPoints.map((pt, i) => (
+                          <g key={i} filter="url(#dot-glow)">
+                            <circle
+                              cx={pt.x} cy={pt.y}
+                              r="5"
+                              fill="rgba(16,185,129,0.25)"
+                              stroke="rgba(16,185,129,0.7)"
+                              strokeWidth="1"
+                            />
+                            <circle
+                              cx={pt.x} cy={pt.y}
+                              r="2.5"
+                              fill="#10b981"
+                            />
+                          </g>
                         ))}
 
+                        {/* Drag handle — ROI start */}
                         <g
                           className="cursor-ns-resize"
                           onPointerDown={(event) => {
@@ -1077,10 +1357,11 @@ export default function App() {
                             updateRoiHandle(event.clientY, 'start');
                           }}
                         >
-                          <line x1="0" y1={`${(localResult.y1 / localResult.height) * 100}`} x2="100" y2={`${(localResult.y1 / localResult.height) * 100}`} stroke="transparent" strokeWidth="5" />
-                          <circle cx="92" cy={`${(localResult.y1 / localResult.height) * 100}`} r="2.2" fill="#ef4444" stroke="white" strokeWidth="0.5" />
+                          <line x1="0" y1={localResult.boundaryY1 ?? localResult.y1} x2={localResult.width} y2={localResult.boundaryY1 ?? localResult.y1} stroke="transparent" strokeWidth="14" />
+                          <circle cx={localResult.width * 0.92} cy={localResult.boundaryY1 ?? localResult.y1} r="7" fill="#ef4444" stroke="white" strokeWidth="1.5" />
                         </g>
 
+                        {/* Drag handle — ROI end */}
                         <g
                           className="cursor-ns-resize"
                           onPointerDown={(event) => {
@@ -1089,10 +1370,23 @@ export default function App() {
                             updateRoiHandle(event.clientY, 'end');
                           }}
                         >
-                          <line x1="0" y1={`${(localResult.y2 / localResult.height) * 100}`} x2="100" y2={`${(localResult.y2 / localResult.height) * 100}`} stroke="transparent" strokeWidth="5" />
-                          <circle cx="92" cy={`${(localResult.y2 / localResult.height) * 100}`} r="2.2" fill="#ef4444" stroke="white" strokeWidth="0.5" />
+                          <line x1="0" y1={localResult.boundaryY2 ?? localResult.y2} x2={localResult.width} y2={localResult.boundaryY2 ?? localResult.y2} stroke="transparent" strokeWidth="14" />
+                          <circle cx={localResult.width * 0.92} cy={localResult.boundaryY2 ?? localResult.y2} r="7" fill="#ef4444" stroke="white" strokeWidth="1.5" />
                         </g>
                       </svg>
+                    )}
+
+                    {/* Deskew angle badge */}
+                    {localResult?.deskewAngle !== undefined && localResult.deskewAngle !== 0 && (
+                      <div className="absolute top-2 left-2 bg-black/70 backdrop-blur-sm text-white text-xs font-mono px-2 py-1 rounded-lg flex items-center gap-1.5 pointer-events-none select-none">
+                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="shrink-0">
+                          <path d="M2 10 L10 2 M7 2 L10 2 L10 5" stroke="#ff4444" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                        </svg>
+                        <span>
+                          {language === 'zh' ? '已校正' : 'Deskewed'}&nbsp;
+                          <span className="text-red-400">{localResult.deskewAngle > 0 ? '+' : ''}{localResult.deskewAngle.toFixed(1)}°</span>
+                        </span>
+                      </div>
                     )}
                   </div>
                 </div>
@@ -1135,6 +1429,7 @@ export default function App() {
                     key={stack.length}
                     initial={{ scale: 1.2, color: '#10b981' }}
                     animate={{ scale: 1, color: '#18181b' }}
+                    data-testid="total-count"
                     className="text-4xl font-black tabular-nums"
                   >
                     {stack.length}
@@ -1167,6 +1462,17 @@ export default function App() {
               </motion.div>
             )}
           </AnimatePresence>
+
+          <div className="hidden" data-testid="local-result-json">
+            {JSON.stringify({
+              count: stack.length,
+              analysisMode,
+              uploadedImage: Boolean(uploadedImage),
+              error,
+              isProcessing,
+              localResult
+            })}
+          </div>
         </div>
 
         {/* Controls */}
@@ -1185,7 +1491,7 @@ export default function App() {
         {/* Footer */}
         <footer className="mt-8 text-center">
           <p className="text-xs text-zinc-400 font-medium uppercase tracking-tighter">
-            {t.footer} • v1.0.9
+            {t.footer} • v{__APP_VERSION__}
           </p>
         </footer>
       </div>

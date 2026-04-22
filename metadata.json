@@ -1,5 +1,5 @@
 {
   "name": "Stack-Counter",
-  "description": "AI-powered layer detection and visual counter with advanced model settings (v1.0.2).",
+  "description": "AI-powered layer detection and visual counter with advanced model settings (v1.0.99).",
   "requestFramePermissions": ["camera"]
 }
